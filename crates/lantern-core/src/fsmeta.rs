@@ -28,6 +28,7 @@ pub(crate) struct Stat {
 }
 
 impl Stat {
+    #[cfg(windows)]
     fn other(kind: EntryKind) -> Self {
         Self {
             kind,
