@@ -94,7 +94,6 @@ pub(super) fn inventory(scan: &Scan<'_>) -> Result<Inventory> {
     Ok(Inventory {
         files: classify(stats, &rules)?,
         rules_digest: rules.digest(),
-        gitlinks: Vec::new(),
         head: None,
         branch: None,
     })

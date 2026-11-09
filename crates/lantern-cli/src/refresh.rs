@@ -1,7 +1,6 @@
-//! The refresh pipeline of one shard: inventory, diff, parallel prepare, one writer, one commit.
+//! The refresh pipeline of one root: inventory, diff, parallel prepare, one writer, one commit.
 
-use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
@@ -12,22 +11,22 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::extract::{self, Extraction};
-use crate::fsmeta::{self, Content};
+use crate::fsmeta::{self, Content, Stat};
 use crate::home::{FOLDER_DEFAULTS, Home};
 use crate::language::Language;
-use crate::limits::{self, MAX_PARSE_ATTEMPTS, REFRESH_ATTEMPTS};
+use crate::limits::{self, MAX_PARSE_ATTEMPTS, RACY_SLACK_MS, REFRESH_ATTEMPTS};
 use crate::source::{Entry, Inventory, Scan, SourceKind};
+use crate::store::remove_database;
 use crate::store::shard::{self, BlobKey, FileRow, Meta, Names, NewBlob};
 
-/// Settings that decide eligibility and freshness.
+/// Settings that decide eligibility and the refresh deadline.
 #[derive(Debug, Clone)]
 pub(crate) struct Settings {
-    pub verify_interval_ms: i64,
     pub max_file_size: u64,
     pub timeout: Option<std::time::Duration>,
 }
 
-/// One physical root to refresh.
+/// One root to refresh.
 #[derive(Debug, Clone)]
 pub(crate) struct Target {
     pub root: PathBuf,
@@ -37,6 +36,7 @@ pub(crate) struct Target {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
+    /// Reread only what changed.
     Incremental,
     /// Build a new shard from the disk and swap it in.
     Rebuild,
@@ -65,7 +65,8 @@ impl std::ops::AddAssign for RefreshCounts {
 #[derive(Debug, Clone)]
 pub(crate) struct Refreshed {
     pub counts: RefreshCounts,
-    pub gitlinks: Vec<String>,
+    /// Removed content can still be in the write-ahead log, because a reader held it open.
+    pub checkpoint_pending: bool,
 }
 
 pub(crate) fn refresh(
@@ -73,8 +74,8 @@ pub(crate) fn refresh(
     target: &Target,
     settings: &Settings,
     mode: Mode,
-    deadline: Option<Instant>,
 ) -> Result<Refreshed> {
+    let deadline = settings.timeout.map(|timeout| Instant::now() + timeout);
     let shard_path = home.shard_path(&target.root_key);
     let warm = shard::open_existing(&shard_path)?
         .map(|conn| shard::meta(&conn))
@@ -103,7 +104,7 @@ fn rebuild(
     let generation = shard::meta(&live)?.map_or(0, |meta| meta.generation);
     let staging = shard_path.with_extension("rebuild");
     remove_database(&staging)?;
-    let refreshed = refresh_shard(
+    let mut refreshed = refresh_shard(
         home,
         target,
         settings,
@@ -120,23 +121,8 @@ fn rebuild(
     remove_database(&staging)?;
     // The live WAL still holds the old pages, removed content included.
     live.execute("UPDATE meta SET checkpoint_pending = 1", [])?;
-    checkpoint(&live)?;
+    refreshed.checkpoint_pending = !checkpoint(&live)?;
     Ok(refreshed)
-}
-
-/// Deletes a database file with its WAL and shared-memory files.
-pub(crate) fn remove_database(path: &Path) -> Result<()> {
-    for suffix in ["", "-wal", "-shm"] {
-        let mut name = path.as_os_str().to_owned();
-        name.push(suffix);
-        let file = PathBuf::from(name);
-        match fs::remove_file(&file) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(Error::io(&file, &error)),
-        }
-    }
-    Ok(())
 }
 
 fn refresh_shard(
@@ -149,9 +135,6 @@ fn refresh_shard(
 ) -> Result<Refreshed> {
     let mut conn = shard::open(shard_path)?;
     let meta = shard::meta(&conn)?;
-    if meta.as_ref().is_some_and(|meta| meta.checkpoint_pending) {
-        checkpoint(&conn)?;
-    }
     let defaults_file = home.defaults_path();
     let scan = Scan {
         root: &target.root,
@@ -166,10 +149,10 @@ fn refresh_shard(
         meta: meta.as_ref(),
         forced_generation,
     };
-    let committed = job.attempt_until_stable(&mut conn)?;
-    // After the commit nothing is retried: a second attempt would find no work and hide the counts.
-    if committed.secure {
-        checkpoint(&conn)?;
+    let mut committed = job.attempt_until_stable(&mut conn)?;
+    let was_pending = meta.as_ref().is_some_and(|meta| meta.checkpoint_pending);
+    if committed.secure || was_pending {
+        committed.refreshed.checkpoint_pending = !checkpoint(&conn)?;
     }
     if committed.results_changed {
         conn.execute_batch("PRAGMA optimize")?;
@@ -191,6 +174,91 @@ struct Job<'job> {
     settings: &'job Settings,
     meta: Option<&'job Meta>,
     forced_generation: Option<i64>,
+}
+
+/// What one attempt must write, decided before anything is read.
+struct Work<'work> {
+    existing: &'work HashMap<String, FileRow>,
+    /// Trusted rows whose blob a moved file takes without a read.
+    reuse: HashMap<ReuseKey, Option<i64>>,
+    diff: Diff<'work>,
+    /// Blobs whose last parse timed out.
+    retry: Vec<i64>,
+    reextract: bool,
+    secure: bool,
+}
+
+struct Applied {
+    counts: RefreshCounts,
+    results_changed: bool,
+}
+
+/// The inventory against the stored rows.
+#[derive(Debug)]
+struct Diff<'diff> {
+    /// New paths, and paths whose row cannot be trusted without a read.
+    candidates: Vec<(&'diff String, &'diff Entry)>,
+    /// Trusted rows whose flags changed.
+    flag_updates: Vec<(&'diff String, FileRow)>,
+    removed: Vec<(&'diff String, &'diff FileRow)>,
+}
+
+impl Diff<'_> {
+    fn is_empty(&self) -> bool {
+        self.candidates.is_empty() && self.flag_updates.is_empty() && self.removed.is_empty()
+    }
+}
+
+fn diff<'diff>(
+    inventory: &'diff BTreeMap<String, Entry>,
+    existing: &'diff HashMap<String, FileRow>,
+    trusted: impl Fn(&str, &FileRow) -> bool,
+) -> Diff<'diff> {
+    let mut candidates = Vec::new();
+    let mut flag_updates = Vec::new();
+    for (path, entry) in inventory {
+        let unchanged = existing
+            .get(path)
+            .filter(|row| row.stat == entry.stat && trusted(path, row));
+        match unchanged {
+            Some(row) if row.flags != entry.flags.0 => flag_updates.push((
+                path,
+                FileRow {
+                    flags: entry.flags.0,
+                    ..row.clone()
+                },
+            )),
+            Some(_) => {}
+            None => candidates.push((path, entry)),
+        }
+    }
+    let removed = existing
+        .iter()
+        .filter(|(path, _)| !inventory.contains_key(*path))
+        .collect();
+    Diff {
+        candidates,
+        flag_updates,
+        removed,
+    }
+}
+
+/// Git's racy rule. A file changed at or after the last scan can change again and keep its
+/// stat, so a row is trusted without a read only when its file times are older than that scan.
+fn settled(stat: &Stat, last_scan: Option<i64>) -> bool {
+    last_scan.is_some_and(|scan| stat.last_change_ms() < scan - RACY_SLACK_MS)
+}
+
+/// Re-extraction keeps each blob's language, so files that a new binary detects differently
+/// are read again under their new language.
+fn relabeled_paths(conn: &Connection) -> Result<HashSet<String>> {
+    Ok(shard::file_languages(conn)?
+        .into_iter()
+        .filter(|(path, stored)| {
+            Language::from_file_name(file_name(path)).map(Language::name) != stored.as_deref()
+        })
+        .map(|(path, _)| path)
+        .collect())
 }
 
 /// What preparing one candidate produced.
@@ -222,6 +290,7 @@ impl Job<'_> {
     }
 
     fn attempt(&self, conn: &mut Connection) -> Result<Committed> {
+        let scanned_at = limits::now_ms();
         let inventory = self.scan.inventory(self.target.source)?;
         let policy = self.policy(&inventory);
         let extractor = extract::extractor_version();
@@ -229,51 +298,17 @@ impl Job<'_> {
             .meta
             .is_none_or(|meta| meta.policy != policy || meta.source != self.target.source);
         let reextract = self.meta.is_some_and(|meta| meta.extractor != extractor);
-        // Re-extraction keeps each blob's language, so files that a new binary detects
-        // differently are read again under their new language.
-        let relabeled: HashSet<String> = if reextract {
-            shard::file_languages(conn)?
-                .into_iter()
-                .filter(|(path, stored)| {
-                    Language::from_file_name(file_name(path)).map(Language::name)
-                        != stored.as_deref()
-                })
-                .map(|(path, _)| path)
-                .collect()
+        let relabeled = if reextract {
+            relabeled_paths(conn)?
         } else {
             HashSet::new()
         };
         let existing = shard::files(conn)?;
-        let now = limits::now_ms();
-        let interval = self.settings.verify_interval_ms;
-        let fresh = |row: &FileRow| row.verified_at <= now && now - row.verified_at < interval;
-
-        let mut candidates: Vec<(&String, &Entry)> = Vec::new();
-        let mut flag_updates: Vec<(&String, FileRow)> = Vec::new();
-        for (path, entry) in &inventory.files {
-            let unchanged = existing.get(path).filter(|row| {
-                !policy_changed
-                    && !relabeled.contains(path)
-                    && fresh(row)
-                    && row.identity == entry.stat.identity()
-                    && row.fingerprint == entry.stat.fingerprint()
-            });
-            match unchanged {
-                Some(row) if row.flags != entry.flags.0 => flag_updates.push((
-                    path,
-                    FileRow {
-                        flags: entry.flags.0,
-                        ..row.clone()
-                    },
-                )),
-                Some(_) => {}
-                None => candidates.push((path, entry)),
-            }
-        }
-        let removed: Vec<(&String, &FileRow)> = existing
-            .iter()
-            .filter(|(path, _)| !inventory.files.contains_key(*path))
-            .collect();
+        let last_scan = self.meta.map(|meta| meta.scanned_at);
+        let trusted = |path: &str, row: &FileRow| {
+            !policy_changed && !relabeled.contains(path) && settled(&row.stat, last_scan)
+        };
+        let diff = diff(&inventory.files, &existing, trusted);
 
         let root = self.target.root.to_string_lossy().into_owned();
         let meta_current = self.meta.is_some_and(|meta| {
@@ -290,17 +325,13 @@ impl Job<'_> {
         } else {
             shard::timed_out_blobs(conn, MAX_PARSE_ATTEMPTS)?
         };
-        let nothing_to_do = candidates.is_empty()
-            && retry.is_empty()
-            && removed.is_empty()
-            && flag_updates.is_empty()
-            && meta_current
-            && self.forced_generation.is_none();
+        let nothing_to_do =
+            diff.is_empty() && retry.is_empty() && meta_current && self.forced_generation.is_none();
         if nothing_to_do {
             return Ok(Committed {
                 refreshed: Refreshed {
                     counts: RefreshCounts::default(),
-                    gitlinks: inventory.gitlinks,
+                    checkpoint_pending: false,
                 },
                 secure: false,
                 results_changed: false,
@@ -308,40 +339,103 @@ impl Job<'_> {
         }
 
         // Removed and re-policied content must not stay readable in the FTS index or the WAL.
-        let secure = !removed.is_empty() || (policy_changed && self.meta.is_some());
-        let reuse: HashMap<ReuseKey, Option<i64>> = if policy_changed {
-            HashMap::new()
-        } else {
-            existing
+        let secure = !diff.removed.is_empty() || (policy_changed && self.meta.is_some());
+        let work = Work {
+            existing: &existing,
+            reuse: existing
                 .iter()
-                .filter(|(path, row)| fresh(row) && !relabeled.contains(*path))
-                .map(|(path, row)| {
-                    (
-                        reuse_key(path, &row.identity, &row.fingerprint),
-                        row.blob_id,
-                    )
-                })
-                .collect()
+                .filter(|(path, row)| trusted(path, row))
+                .map(|(path, row)| (reuse_key(path, &row.stat), row.blob_id))
+                .collect(),
+            diff,
+            retry,
+            reextract,
+            secure,
         };
-        let stored_keys = shard::blob_keys(conn)?;
-        let mut inserted: HashMap<BlobKey, i64> = HashMap::new();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut names = Names::default();
-        let mut counts = RefreshCounts::default();
-        let mut results_changed =
-            reextract || !retry.is_empty() || !removed.is_empty() || !flag_updates.is_empty();
-        if reextract {
-            reextract_all(&tx, &mut names, &mut counts)?;
-        } else {
-            reextract_blobs(&tx, &mut names, &mut counts, &retry)?;
+        let Applied {
+            counts,
+            results_changed,
+        } = self.apply(&tx, work)?;
+        if results_changed {
+            let again = self.scan.inventory(self.target.source)?;
+            if !again.same_as(&inventory) {
+                return Err(Error::temporary("files changed during the refresh"));
+            }
         }
 
-        let mut rows: Vec<(&String, FileRow)> = Vec::with_capacity(candidates.len());
+        let committed_generation = shard::meta(&tx)?.map_or(0, |meta| meta.generation);
+        let expected_generation = self.meta.map_or(0, |meta| meta.generation);
+        if committed_generation != expected_generation {
+            return Err(Error::temporary("another refresh committed first"));
+        }
+        let generation = match self.forced_generation {
+            Some(generation) => generation,
+            None if results_changed => expected_generation + 1,
+            None => expected_generation,
+        };
+        let indexed_at = match self.meta.and_then(|meta| meta.indexed_at) {
+            Some(at) if !results_changed => at,
+            _ => scanned_at,
+        };
+        shard::write_meta(
+            &tx,
+            &Meta {
+                root,
+                root_key: self.target.root_key.clone(),
+                source: self.target.source,
+                head: inventory.head.clone(),
+                branch: inventory.branch.clone(),
+                policy,
+                extractor,
+                indexed_at: Some(indexed_at),
+                generation,
+                scanned_at,
+                // A commit that removes nothing must not clear a checkpoint that is still owed.
+                checkpoint_pending: secure || self.meta.is_some_and(|meta| meta.checkpoint_pending),
+            },
+        )?;
+        tx.commit()?;
+        Ok(Committed {
+            refreshed: Refreshed {
+                counts,
+                checkpoint_pending: false,
+            },
+            secure,
+            results_changed,
+        })
+    }
+
+    /// Writes the blobs and file rows of one attempt into the open transaction.
+    fn apply(&self, tx: &Connection, work: Work<'_>) -> Result<Applied> {
+        let Work {
+            existing,
+            reuse,
+            diff,
+            retry,
+            reextract,
+            secure,
+        } = work;
+        let stored_keys = shard::blob_keys(tx)?;
+        let mut inserted: HashMap<BlobKey, i64> = HashMap::new();
+        let mut names = Names::default();
+        let mut counts = RefreshCounts::default();
+        let mut results_changed = reextract
+            || !retry.is_empty()
+            || !diff.removed.is_empty()
+            || !diff.flag_updates.is_empty();
+        if reextract {
+            reextract_all(tx, &mut names, &mut counts)?;
+        } else {
+            reextract_blobs(tx, &mut names, &mut counts, &retry)?;
+        }
+
+        let mut rows: Vec<(&String, FileRow)> = Vec::with_capacity(diff.candidates.len());
         let mut touched: Vec<i64> = Vec::new();
         let prepare =
             |(path, entry): &(&String, &Entry)| self.prepare(path, entry, &reuse, &stored_keys);
-        let prepared = prepare_all(&candidates, prepare, |index, prepared| {
-            let (path, entry) = candidates[index];
+        prepare_all(&diff.candidates, prepare, |index, prepared| {
+            let (path, entry) = diff.candidates[index];
             let blob_id = match prepared {
                 Prepared::Known { blob_id, reused } => {
                     counts.reused += u64::from(reused);
@@ -352,7 +446,7 @@ impl Job<'_> {
                     if let Some(&id) = inserted.get(&blob.key) {
                         Some(id)
                     } else {
-                        let id = shard::insert_blob(&tx, &mut names, &blob)?;
+                        let id = shard::insert_blob(tx, &mut names, &blob)?;
                         inserted.insert(blob.key, id);
                         Some(id)
                     }
@@ -373,75 +467,29 @@ impl Job<'_> {
                 path,
                 FileRow {
                     blob_id,
-                    size: entry.stat.size as i64,
                     flags: entry.flags.0,
-                    identity: entry.stat.identity(),
-                    fingerprint: entry.stat.fingerprint(),
-                    verified_at: now,
+                    stat: entry.stat,
                 },
             ));
             Ok(())
-        });
-        prepared?;
+        })?;
 
-        if results_changed {
-            let again = self.scan.inventory(self.target.source)?;
-            if !again.same_as(&inventory) {
-                return Err(Error::temporary("files changed during the refresh"));
-            }
+        for (path, row) in rows.iter().chain(&diff.flag_updates) {
+            shard::upsert_file(tx, path, row)?;
         }
-        for (path, row) in rows.iter().chain(&flag_updates) {
-            shard::upsert_file(&tx, path, row)?;
-        }
-        for (path, row) in &removed {
-            shard::delete_file(&tx, path)?;
+        for (path, row) in &diff.removed {
+            shard::delete_file(tx, path)?;
             touched.extend(row.blob_id);
             counts.removed += 1;
         }
-        let orphans = shard::delete_orphans(&tx, touched)?;
+        let orphans = shard::delete_orphans(tx, touched)?;
         if secure && orphans > 0 {
             // Merge FTS segments so deleted postings are dropped, not only marked.
             tx.execute("INSERT INTO blobs_fts (blobs_fts) VALUES ('optimize')", [])?;
-            shard::delete_unused_names(&tx)?;
+            shard::delete_unused_names(tx)?;
         }
-
-        let committed_generation = shard::meta(&tx)?.map_or(0, |meta| meta.generation);
-        let expected_generation = self.meta.map_or(0, |meta| meta.generation);
-        if committed_generation != expected_generation {
-            return Err(Error::temporary("another refresh committed first"));
-        }
-        let generation = match self.forced_generation {
-            Some(generation) => generation,
-            None if results_changed => expected_generation + 1,
-            None => expected_generation,
-        };
-        let previous_indexed_at = self.meta.and_then(|meta| meta.indexed_at);
-        let indexed_at = match previous_indexed_at {
-            Some(at) if !results_changed => at,
-            _ => now,
-        };
-        shard::write_meta(
-            &tx,
-            &Meta {
-                root,
-                root_key: self.target.root_key.clone(),
-                source: self.target.source,
-                head: inventory.head.clone(),
-                branch: inventory.branch.clone(),
-                policy,
-                extractor,
-                indexed_at: Some(indexed_at),
-                generation,
-                checkpoint_pending: secure,
-            },
-        )?;
-        tx.commit()?;
-        Ok(Committed {
-            refreshed: Refreshed {
-                counts,
-                gitlinks: inventory.gitlinks,
-            },
-            secure,
+        Ok(Applied {
+            counts,
             results_changed,
         })
     }
@@ -464,8 +512,7 @@ impl Job<'_> {
         keys: &HashMap<BlobKey, i64>,
     ) -> Result<Prepared> {
         self.scan.check_deadline()?;
-        let key = reuse_key(path, &entry.stat.identity(), &entry.stat.fingerprint());
-        if let Some(&blob_id) = reuse.get(&key) {
+        if let Some(&blob_id) = reuse.get(&reuse_key(path, &entry.stat)) {
             return Ok(Prepared::Known {
                 blob_id,
                 reused: true,
@@ -497,17 +544,13 @@ impl Job<'_> {
     }
 }
 
-/// An unchanged file seen at a new path: identity, fingerprint, and file name.
-type ReuseKey = (String, String, String);
+/// An unchanged file seen at a new path: its stat and file name.
+type ReuseKey = (Stat, String);
 
 /// The language depends only on the file name and the content, so a move that keeps the file
 /// name keeps the blob; a rename such as `tool` to `tool.py` reads the file again.
-fn reuse_key(path: &str, identity: &str, fingerprint: &str) -> ReuseKey {
-    (
-        identity.to_owned(),
-        fingerprint.to_owned(),
-        file_name(path).to_owned(),
-    )
+fn reuse_key(path: &str, stat: &Stat) -> ReuseKey {
+    (*stat, file_name(path).to_owned())
 }
 
 fn file_name(path: &str) -> &str {
@@ -524,15 +567,15 @@ fn blob_key(language: Option<Language>, bytes: &[u8]) -> BlobKey {
 }
 
 /// Copies the WAL into the shard and empties it, so removed content does not stay there.
-fn checkpoint(conn: &Connection) -> Result<()> {
+/// Returns false when a reader blocked it; `meta.checkpoint_pending` then stays set, and the
+/// next refresh tries again.
+fn checkpoint(conn: &Connection) -> Result<bool> {
     let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
     if busy != 0 {
-        return Err(Error::temporary(
-            "the index was updated, but a query held it open, so removed content can still be in the write-ahead log; run `lantern index` again",
-        ));
+        return Ok(false);
     }
     conn.execute("UPDATE meta SET checkpoint_pending = 0", [])?;
-    Ok(())
+    Ok(true)
 }
 
 fn new_blob(
@@ -640,4 +683,50 @@ fn reextract_blobs(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::language::FileFlags;
+
+    #[test]
+    fn a_file_changed_near_the_last_scan_is_read_again() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("a.ts");
+        std::fs::write(&path, "export const a = 1;\n").expect("write file");
+        let stat = fsmeta::lstat(&path).expect("stat file");
+        let now = limits::now_ms();
+        assert!(
+            (stat.last_change_ms() - now).abs() < 60_000,
+            "file time {} is not near the clock {now}",
+            stat.last_change_ms()
+        );
+
+        let entry = Entry {
+            stat,
+            flags: FileFlags(0),
+        };
+        let inventory = BTreeMap::from([("a.ts".to_owned(), entry)]);
+        let candidates = |stored: Stat, last_scan: i64| {
+            let row = FileRow {
+                blob_id: Some(1),
+                flags: 0,
+                stat: stored,
+            };
+            let existing = HashMap::from([("a.ts".to_owned(), row)]);
+            diff(&inventory, &existing, |_, row| {
+                settled(&row.stat, Some(last_scan))
+            })
+            .candidates
+            .len()
+        };
+        assert_eq!(candidates(stat, now), 1, "written at the scan time");
+        assert_eq!(candidates(stat, now + 60_000), 0, "written long before");
+        let resized = Stat {
+            size: stat.size + 1,
+            ..stat
+        };
+        assert_eq!(candidates(resized, now + 60_000), 1, "stat differs");
+    }
 }

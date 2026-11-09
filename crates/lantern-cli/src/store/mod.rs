@@ -1,9 +1,9 @@
-//! SQLite storage: one catalog plus one shard per physical root.
+//! SQLite storage: one shard per root.
 
-pub(crate) mod catalog;
 pub(crate) mod shard;
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -11,7 +11,7 @@ use rusqlite::{Connection, ErrorCode, OpenFlags};
 
 use crate::error::{Error, Result};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Opens a database with the shared pragmas and runs `schema` when `user_version` is 0.
 fn open(path: &Path, schema: &str) -> Result<Connection> {
@@ -19,6 +19,12 @@ fn open(path: &Path, schema: &str) -> Result<Connection> {
         | OpenFlags::SQLITE_OPEN_CREATE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let mut conn = connect(path, flags)?;
+    if (1..SCHEMA_VERSION).contains(&user_version(&conn)?) {
+        // An index from an older Lantern is a cache; build it again.
+        drop(conn);
+        remove_database(path)?;
+        conn = connect(path, flags)?;
+    }
     enable_wal(&conn)?;
     conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;")?;
     if user_version(&conn)? == 0 {
@@ -35,11 +41,11 @@ fn open(path: &Path, schema: &str) -> Result<Connection> {
 }
 
 /// Opens an existing database for queries; it never writes. `None` while its schema is not
-/// yet committed.
+/// yet committed, or when an older Lantern wrote it.
 fn open_read_only(path: &Path) -> Result<Option<Connection>> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = connect(path, flags)?;
-    if user_version(&conn)? == 0 {
+    if user_version(&conn)? < SCHEMA_VERSION {
         return Ok(None);
     }
     check_version(path, &conn)?;
@@ -73,6 +79,21 @@ fn enable_wal(conn: &Connection) -> Result<()> {
             Err(error) => return Err(error.into()),
         }
     }
+}
+
+/// Deletes a database file with its WAL and shared-memory files.
+pub(crate) fn remove_database(path: &Path) -> Result<()> {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        let file = PathBuf::from(name);
+        match fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Error::io(&file, &error)),
+        }
+    }
+    Ok(())
 }
 
 fn check_version(path: &Path, conn: &Connection) -> Result<()> {

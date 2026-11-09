@@ -127,11 +127,16 @@ fn invalid_patterns_and_escaping_paths_are_usage_errors() {
 }
 
 #[test]
-fn symbol_ranking_puts_exact_then_prefix_then_initials() {
+fn symbol_ranking_puts_exact_then_prefix_then_initials_then_substring() {
     let f = Fixture::new();
     f.write(
         "symbols.ts",
-        "export function bWT() {}\nexport function bWTExtra() {}\nexport function buildWorkspaceTree() {}\nexport function xbWT() {}\nexport type DEFAULT_EXPLORER_STATE = {};\nexport function getUserById() {}\n",
+        "export function bWT() {}\nexport function bWTExtra() {}\nexport function buildWorkspaceTree() {}\nexport function xbWT() {}\nexport type DEFAULT_EXPLORER_STATE = {};\nexport function getUserById() {}\nexport function streetreeIndex() {}\nexport function parseTreeNode() {}\n",
+    );
+    assert_eq!(
+        names(&f.ok(&["symbols", "tree"])),
+        strings(&["parseTreeNode", "buildWorkspaceTree", "streetreeIndex"]),
+        "a match at a word start ranks first, then the shorter name"
     );
     let top = f.ok(&["symbols", "bWT", "--limit", "3"]);
     assert_eq!(
@@ -591,16 +596,15 @@ fn grep_habits_work_or_explain_themselves() {
     let f = Fixture::new();
     f.write(
         "a.ts",
-        "run --flag
+        "run --flag --json
 Needle
 ",
     );
-    assert_eq!(
-        f.text(&["code", "-e", "--flag"]),
-        "a.ts
-1:run --flag
-"
-    );
+    let flag_line = "a.ts
+1:run --flag --json
+";
+    assert_eq!(f.text(&["code", "-e", "--flag"]), flag_line);
+    assert_eq!(f.text(&["code", "-e", "--json"]), flag_line);
     assert_eq!(
         f.text(&["code", "-i", "needle"]),
         f.text(&["code", "needle"])

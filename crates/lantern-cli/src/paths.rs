@@ -6,7 +6,7 @@ pub(crate) fn canonical(path: &Path) -> io::Result<PathBuf> {
     dunce::canonicalize(path)
 }
 
-/// The catalog key of a physical root: the resolved path, lowercased on Windows.
+/// The key of a root: the resolved path, lowercased on Windows.
 pub(crate) fn root_key(root: &Path) -> String {
     let text = root.to_string_lossy();
     if cfg!(windows) {

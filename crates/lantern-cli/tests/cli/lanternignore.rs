@@ -91,7 +91,7 @@ fn removed_content_is_not_left_in_the_shard_or_its_wal() {
 }
 
 #[test]
-fn a_blocked_checkpoint_exits_temporary_and_the_next_refresh_finishes_it() {
+fn a_blocked_checkpoint_fails_only_index_and_the_next_refresh_finishes_it() {
     let f = Fixture::new();
     f.write("a.ts", "export function a() {}\n");
     f.write("b.ts", "export function b() {}\n");
@@ -107,6 +107,7 @@ fn a_blocked_checkpoint_exits_temporary_and_the_next_refresh_finishes_it() {
         .execute_batch("BEGIN; SELECT count(*) FROM files;")
         .expect("hold a read transaction");
     f.remove("b.ts");
+    assert!(names(&f.ok(&["symbols", "b"])).is_empty());
     let blocked = f.lantern(&["index"]);
     assert_eq!(blocked.code, 75, "{}", blocked.stderr);
     drop(reader);

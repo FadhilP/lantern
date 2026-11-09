@@ -22,6 +22,19 @@ $ lantern outline src/user.ts     # 5. What is in this file?
 | Integration | None in v1. Lantern is a standalone tool. Integration with other hosts comes later. |
 | Implementation status | v1 implemented. This plan is the design record; the code and [cli.md](cli.md) describe current behavior. |
 
+## Changes since this plan
+
+The code no longer follows these parts of the plan. The sections below still show the first design.
+
+| Plan | Now | Why |
+|---|---|---|
+| A catalog, and one shard per physical repository; a workspace lists member shards (7.1, 8) | One shard per root. The Git inventory adds the files of each checked-out gitlink under its prefix. No catalog. | Much less code. A start directory inside a submodule resolves to the outermost repository that holds it as a gitlink, so each file is indexed once. Cost: a query from the submodule refreshes the whole outer repository. |
+| `--verify-interval` rereads every file after 300 s (6.6) | A stored row is trusted when its metadata is equal and its file times are at least 2 s older than the last committed scan (Git's racy rule). The option is removed. | No full reread of the tree every 5 minutes. Cost: an edit that keeps size, mtime, ctime, and identity is not seen. |
+| A blocked checkpoint exits 75 (6.4) | Only `index` exits 75. A query succeeds and the next refresh tries again. | A query must not fail because another query was reading. |
+| `nucleo-matcher` fuzzy ranking (3.2, 9.4) | Exact, prefix, initials, then substring; no subsequence matching. | Precise results, and every candidate comes from an index. |
+| `lantern-core` library and `lantern-cli` binary (4) | One crate, `lantern-cli`. | The library API was not public or stable. |
+| Fingerprint and identity stored as text | Integer columns in the platform's unit. Schema version 2; an older shard is built again. | No string formatting per file per query. |
+
 ---
 
 ## 1. Scope

@@ -1388,33 +1388,20 @@ dependencies = [
 
 [[package]]
 name = "lantern-cli"
-version = "0.1.0"
-dependencies = [
- "clap",
- "dunce",
- "lantern-core",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "lantern-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
+ "clap",
  "dunce",
  "gix",
  "globset",
  "ignore",
- "nucleo-matcher",
  "rayon",
  "regex",
  "regex-syntax",
  "rusqlite",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tree-sitter",
@@ -1498,16 +1485,6 @@ name = "nonempty"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9737e026353e5cd0736f98eddae28665118eb6f6600902a7f50db585621fecb6"
-
-[[package]]
-name = "nucleo-matcher"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf33f538733d1a5a3494b836ba913207f14d9d4a1d3cd67030c5061bdd2cac85"
-dependencies = [
- "memchr",
- "unicode-segmentation",
-]
 
 [[package]]
 name = "once_cell"
@@ -2037,12 +2014,6 @@ checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
 dependencies = [
  "tinyvec",
 ]
-
-[[package]]
-name = "unicode-segmentation"
-version = "1.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "utf8parse"

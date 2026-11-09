@@ -3,9 +3,14 @@
 
 use std::io::Write;
 
-use lantern_core::{
-    CodeHit, Error, ErrorKind, Graph, Outline, OutlineNode, Page, RefHit, SymbolHit, SymbolKind,
-};
+use crate::error::{Error, ErrorKind};
+use crate::extract::SymbolKind;
+use crate::query::Page;
+use crate::query::code::CodeHit;
+use crate::query::graph::Graph;
+use crate::query::outline::{Outline, OutlineNode};
+use crate::query::refs::RefHit;
+use crate::query::symbols::SymbolHit;
 use serde::Serialize;
 use serde_json::{Value, json};
 

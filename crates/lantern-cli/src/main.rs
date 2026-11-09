@@ -1,19 +1,40 @@
 //! `lantern`: read-only code discovery for large codebases.
 
+mod engine;
+mod error;
+mod extract;
+mod fsmeta;
+mod home;
+mod language;
+mod limits;
 mod output;
+mod paths;
+mod query;
+mod refresh;
+mod rules;
+mod source;
+mod store;
+mod workspace;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
-use lantern_core::{
-    CodeQuery, CodeSort, DEFAULT_CODE_LIMIT, DEFAULT_GRAPH_DEPTH, DEFAULT_GRAPH_NODES,
-    DEFAULT_LIMIT, DEFAULT_PER_FILE, Direction, Error, ErrorKind, Freshness, GraphQuery, IndexMode,
-    Lantern, Options, PageRequest, RefKind, RefsQuery, SymbolKind, SymbolQuery,
-};
+use clap::{Args, Parser, Subcommand};
 
+use crate::engine::{Lantern, Options};
+use crate::error::{Error, ErrorKind};
+use crate::extract::{RefKind, SymbolKind};
+use crate::limits::{
+    DEFAULT_CODE_LIMIT, DEFAULT_GRAPH_DEPTH, DEFAULT_GRAPH_NODES, DEFAULT_LIMIT, DEFAULT_PER_FILE,
+};
 use crate::output::Printer;
+use crate::query::code::{CodeQuery, CodeSort};
+use crate::query::graph::{Direction, GraphQuery};
+use crate::query::refs::RefsQuery;
+use crate::query::symbols::SymbolQuery;
+use crate::query::{Freshness, PageRequest};
+use crate::refresh::Mode;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -37,15 +58,6 @@ struct Cli {
         value_name = "MS"
     )]
     timeout: u64,
-    /// Reread files whose last verification is at least this old (0 to 300000 ms).
-    #[arg(
-        long,
-        env = "LANTERN_VERIFY_INTERVAL_MS",
-        global = true,
-        default_value_t = 300_000,
-        value_name = "MS"
-    )]
-    verify_interval: u64,
     /// Larger files are not indexed as text. Accepts K, M, and G suffixes.
     #[arg(long, env = "LANTERN_MAX_FILE_SIZE", global = true, default_value = "1M", value_parser = parse_size, value_name = "BYTES")]
     max_file_size: u64,
@@ -110,8 +122,8 @@ enum Command {
         per_file: usize,
         #[arg(long, default_value_t = 0, value_name = "N")]
         context: usize,
-        #[arg(long, value_enum, default_value_t = SortArg::Relevance)]
-        sort: SortArg,
+        #[arg(long, value_enum, default_value_t = CodeSort::Relevance)]
+        sort: CodeSort,
         #[arg(long)]
         include_generated: bool,
         #[command(flatten)]
@@ -133,8 +145,8 @@ enum Command {
     /// What calls X, and what does X call?
     Graph {
         name: String,
-        #[arg(long, value_enum, default_value_t = DirectionArg::Both)]
-        direction: DirectionArg,
+        #[arg(long, value_enum, default_value_t = Direction::Both)]
+        direction: Direction,
         #[arg(long, default_value_t = DEFAULT_GRAPH_DEPTH, value_name = "N")]
         depth: usize,
         #[arg(long, default_value_t = DEFAULT_GRAPH_NODES, value_name = "N")]
@@ -184,19 +196,6 @@ impl PageArgs {
     }
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum SortArg {
-    Relevance,
-    Path,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum DirectionArg {
-    Callers,
-    Callees,
-    Both,
-}
-
 fn main() -> ExitCode {
     let json_requested = std::env::args().any(|arg| arg == "--json");
     let cli = match Cli::try_parse() {
@@ -211,7 +210,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let printer = Printer::new(cli.json || json_requested);
+    let printer = Printer::new(cli.json);
     match run(cli, &printer) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -240,7 +239,6 @@ fn run(cli: Cli, printer: &Printer) -> Result<(), Error> {
     let lantern = Lantern::open(&Options {
         home: cli.home,
         timeout: (cli.timeout > 0).then(|| Duration::from_millis(cli.timeout)),
-        verify_interval: Duration::from_millis(cli.verify_interval),
         max_file_size: cli.max_file_size,
     })?;
     let freshness = |stale_ok: bool| {
@@ -253,9 +251,9 @@ fn run(cli: Cli, printer: &Printer) -> Result<(), Error> {
     match cli.command {
         Command::Index { path, rebuild } => {
             let mode = if rebuild {
-                IndexMode::Rebuild
+                Mode::Rebuild
             } else {
-                IndexMode::Incremental
+                Mode::Incremental
             };
             let report = lantern.index(&cwd.join(path.unwrap_or_default()), mode)?;
             printer.document(&report);
@@ -285,7 +283,7 @@ fn run(cli: Cli, printer: &Printer) -> Result<(), Error> {
                 freshness(page.stale_ok),
                 &page.request(DEFAULT_LIMIT),
             )?;
-            let note = unparsed_note(&lantern, &cwd, found.rows.is_empty())?;
+            let note = unparsed_note(found.unparsed_files);
             let empty = format!(
                 "no results; for a field, a key, or text, try: lantern code \"{}\"{note}",
                 query.query
@@ -309,10 +307,6 @@ fn run(cli: Cli, printer: &Printer) -> Result<(), Error> {
             let pattern = pattern
                 .or(dash_pattern)
                 .ok_or_else(|| Error::new(ErrorKind::Usage, "a pattern is required"))?;
-            let sort = match sort {
-                SortArg::Relevance => CodeSort::Relevance,
-                SortArg::Path => CodeSort::Path,
-            };
             let query = CodeQuery {
                 pattern,
                 regex,
@@ -358,7 +352,7 @@ fn run(cli: Cli, printer: &Printer) -> Result<(), Error> {
                 &page.request(DEFAULT_LIMIT),
             )?;
             let extra = [("resolution", serde_json::json!("name"))];
-            let note = unparsed_note(&lantern, &cwd, found.rows.is_empty())?;
+            let note = unparsed_note(found.unparsed_files);
             let empty = format!(
                 "no results; refs records calls, types, imports, and implementations by exact, case-sensitive name. For a field, a key, or text, try: lantern code \"{}\"{note}",
                 query.name
@@ -376,11 +370,6 @@ fn run(cli: Cli, printer: &Printer) -> Result<(), Error> {
             stale_ok,
             max_bytes,
         } => {
-            let direction = match direction {
-                DirectionArg::Callers => Direction::Callers,
-                DirectionArg::Callees => Direction::Callees,
-                DirectionArg::Both => Direction::Both,
-            };
             let query = GraphQuery {
                 name,
                 direction,
@@ -391,7 +380,7 @@ fn run(cli: Cli, printer: &Printer) -> Result<(), Error> {
                 include_generated,
             };
             let graph = lantern.graph(&cwd, &query, freshness(stale_ok))?;
-            let note = unparsed_note(&lantern, &cwd, graph.nodes.is_empty())?;
+            let note = unparsed_note(graph.unparsed_files);
             let empty = format!(
                 "no results; no definition named {}. To find it as text, try: lantern code \"{}\"{note}",
                 query.name, query.name
@@ -405,7 +394,7 @@ fn run(cli: Cli, printer: &Printer) -> Result<(), Error> {
                 freshness(page.stale_ok),
                 &page.request(DEFAULT_LIMIT),
             )?;
-            let note = unparsed_note(&lantern, &cwd, outline.symbols.rows.is_empty())?;
+            let note = unparsed_note(outline.symbols.unparsed_files);
             printer.outline(&outline, page.max_bytes, &note)?;
         }
     }
@@ -413,22 +402,13 @@ fn run(cli: Cli, printer: &Printer) -> Result<(), Error> {
 }
 
 /// Text for an empty result: files that ran out of parse time hold no symbols to find.
-fn unparsed_note(lantern: &Lantern, cwd: &Path, found_nothing: bool) -> Result<String, Error> {
-    if !found_nothing {
-        return Ok(String::new());
+fn unparsed_note(unparsed_files: u64) -> String {
+    if unparsed_files == 0 {
+        return String::new();
     }
-    let unparsed: u64 = lantern
-        .status(cwd)?
-        .members
-        .iter()
-        .map(|member| member.unparsed_files)
-        .sum();
-    if unparsed == 0 {
-        return Ok(String::new());
-    }
-    Ok(format!(
-        " Parsing ran out of time for {unparsed} file(s), so their symbols are missing. To parse them again, run: lantern index --rebuild"
-    ))
+    format!(
+        " Parsing ran out of time for {unparsed_files} file(s), so their symbols are missing. To parse them again, run: lantern index --rebuild"
+    )
 }
 
 /// `-C 3` is grep's context flag; here `-C` takes a directory.

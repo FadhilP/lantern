@@ -12,7 +12,7 @@ lantern outline src/user.ts      # What is in this file?
 
 - **Always fresh.** Every query refreshes the index first and reads only changed files, so results match the disk.
 - **Read-only.** Lantern never writes inside your repository. The index lives in your user data directory.
-- **Git-aware.** In a Git repository it indexes tracked files plus untracked files that Git does not ignore. Checked-out submodules are part of the same workspace. Outside Git it indexes a folder with `.gitignore` rules and sensible default excludes.
+- **Git-aware.** In a Git repository it indexes tracked files plus untracked files that Git does not ignore. Checked-out submodules are part of the same index. Outside Git it indexes a folder with `.gitignore` rules and sensible default excludes.
 - **Built for agents.** JSON output, stable cursors, a `--max-bytes` output budget, and exit codes that say what to do next.
 - **13 grammars.** Symbols and references for C, C++, C#, Dart, Go, Java, JavaScript, PHP, Python, Ruby, Rust, TypeScript, and TSX. `code` searches every text file.
 
@@ -80,7 +80,7 @@ Lockfiles and paths marked `linguist-generated` or `linguist-vendored` in `.gita
 ## Documentation
 
 - [CLI reference](docs/cli.md): every command, flag, output field, and exit code.
-- [Architecture](docs/architecture.md): sources, the shard and catalog layout, the refresh pipeline, and queries.
+- [Architecture](docs/architecture.md): sources, the shard layout, the refresh pipeline, and queries.
 - [Releasing](docs/releasing.md): the tag-driven release workflow and the npm setup.
 - [Implementation plan](docs/implementation-plan.md): the design record and its reasons.
 
@@ -93,7 +93,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 ```
 
-`crates/lantern-core` is the library; `crates/lantern-cli` is the `lantern` binary and its integration tests (`crates/lantern-cli/tests/cli/`). The integration tests need `git` on the `PATH`.
+`crates/lantern-cli` is the `lantern` binary and its integration tests (`crates/lantern-cli/tests/cli/`). The integration tests need `git` on the `PATH`.
 
 ## License
 

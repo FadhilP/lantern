@@ -26,30 +26,22 @@ pub struct OutlineNode {
     pub children: Vec<OutlineNode>,
 }
 
-/// `file` is relative to the start directory `scope` of the workspace.
+/// `file` is relative to the directory `base` of the root.
 pub(crate) fn run(
     opened: &Opened,
-    scope: &str,
+    base: &str,
     file: &str,
     request: &PageRequest,
 ) -> Result<Outline> {
     validate_limit(request)?;
-    let full = paths::resolve_lexically(scope, file)
+    let full = paths::resolve_lexically(base, file)
         .filter(|full| !full.is_empty())
         .ok_or_else(|| Error::usage(format!("{file} is outside the workspace")))?;
-    // The deepest member prefix owns the path.
-    let member = opened
-        .members
-        .iter()
-        .filter(|member| member.local(&full).is_some())
-        .max_by_key(|member| member.prefix.len())
-        .ok_or_else(|| Error::failure(format!("{full} is not in the index")))?;
-    let local = member.local(&full).unwrap_or_default();
-    let language: Option<Option<String>> = member
+    let language: Option<Option<String>> = opened
         .conn
         .query_row(
             "SELECT b.language FROM files f JOIN blobs b ON b.id = f.blob_id WHERE f.path = ?1",
-            [local],
+            [&full],
             |row| row.get(0),
         )
         .map(Some)
@@ -62,13 +54,13 @@ pub(crate) fn run(
             "{full} is not in the index as a text file"
         )));
     };
-    let mut statement = member.conn.prepare(
+    let mut statement = opened.conn.prepare(
         "SELECT n.name, s.kind, s.line, s.end_line, s.signature
          FROM files f JOIN symbols s ON s.blob_id = f.blob_id JOIN names n ON n.id = s.name_id
          WHERE f.path = ?1 ORDER BY s.line, s.end_line DESC, s.col",
     )?;
     let flat: Vec<OutlineNode> = statement
-        .query_map([local], |row| {
+        .query_map([&full], |row| {
             Ok(OutlineNode {
                 name: row.get(0)?,
                 kind: row.get(1)?,

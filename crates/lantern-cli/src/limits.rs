@@ -2,11 +2,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const DEFAULT_MAX_FILE_SIZE: u64 = 1 << 20;
 pub const MAX_MAX_FILE_SIZE: u64 = 64 << 20;
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
-pub const DEFAULT_VERIFY_INTERVAL: Duration = Duration::from_secs(300);
-pub const MAX_VERIFY_INTERVAL: Duration = Duration::from_secs(300);
 
 pub const DEFAULT_LIMIT: usize = 30;
 pub const DEFAULT_CODE_LIMIT: usize = 10;
@@ -29,6 +25,8 @@ pub(crate) const MAX_RULE_FILE_BYTES: u64 = 4 << 20;
 pub(crate) const MAX_RULE_TOTAL_BYTES: u64 = 64 << 20;
 pub(crate) const MAX_DEPTH: usize = 1_024;
 pub(crate) const REFRESH_ATTEMPTS: u32 = 3;
+/// Covers coarse file timestamps (2 s on FAT) when a file time is compared with the scan time.
+pub(crate) const RACY_SLACK_MS: i64 = 2_000;
 /// Parses of one blob that may time out before Lantern stops retrying it.
 pub(crate) const MAX_PARSE_ATTEMPTS: i64 = 3;
 /// Parse budget per MiB of source; small files get the floor.
@@ -43,11 +41,8 @@ pub(crate) fn max_nested() -> usize {
     test_override("LANTERN_TEST_MAX_NESTED").map_or(1_000, |value| value as usize)
 }
 
-/// Milliseconds since the Unix epoch. Debug builds read `LANTERN_TEST_NOW_MS` first.
+/// Milliseconds since the Unix epoch.
 pub(crate) fn now_ms() -> i64 {
-    if let Some(now) = test_override("LANTERN_TEST_NOW_MS") {
-        return now as i64;
-    }
     let since_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();

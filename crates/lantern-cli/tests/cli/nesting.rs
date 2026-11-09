@@ -1,6 +1,6 @@
-//! Gitlinks as member shards, in both indexing orders, plus removal and prune.
+//! Checked-out gitlinks as part of the parent's index, plus removal and prune.
 
-use crate::common::{Fixture, count, names, paths, remove_tree, strings};
+use crate::common::{Fixture, names, paths, remove_tree, strings};
 
 /// An aggregate repository `A` with a committed gitlink to child repository `A/C`.
 fn aggregate() -> Fixture {
@@ -17,13 +17,9 @@ fn aggregate() -> Fixture {
 }
 
 #[test]
-fn parent_reuses_the_shard_of_a_child_indexed_first() {
+fn parent_indexes_the_files_of_a_gitlink_with_its_prefix() {
     let f = aggregate();
-    let (a, c) = (f.path("A"), f.path("A/C"));
-    assert_eq!(count(&f.ok_in(&c, &["index"]), "changed"), 1);
-    let parent = f.ok_in(&a, &["index"]);
-    assert_eq!(count(&parent, "members"), 2);
-    assert_eq!(count(&parent, "changed"), 1, "only A's own file is read");
+    let a = f.path("A");
     assert_eq!(
         paths(&f.ok_in(&a, &["symbols", "childFn"])),
         strings(&["C/lib.ts"])
@@ -40,31 +36,28 @@ fn parent_reuses_the_shard_of_a_child_indexed_first() {
 }
 
 #[test]
-fn child_uses_the_shard_its_parent_created() {
+fn a_gitlink_resolves_to_its_parent_scoped_to_itself() {
     let f = aggregate();
     let (a, c) = (f.path("A"), f.path("A/C"));
-    f.ok_in(&a, &["index"]);
-    assert_eq!(count(&f.ok_in(&c, &["index"]), "changed"), 0);
     assert_eq!(
         paths(&f.ok_in(&c, &["symbols", "childFn"])),
         strings(&["lib.ts"])
     );
-}
-
-#[test]
-fn child_indexed_through_its_parent_answers_stale_queries() {
-    let f = aggregate();
-    let (a, c) = (f.path("A"), f.path("A/C"));
-    f.ok_in(&a, &["index"]);
-    assert_eq!(f.ok_in(&c, &["status"])["indexed"], true);
+    assert!(names(&f.ok_in(&c, &["symbols", "mainFn"])).is_empty());
     assert_eq!(
-        paths(&f.ok_in(&c, &["symbols", "childFn", "--stale-ok"])),
-        strings(&["lib.ts"])
+        f.ok_in(&c, &["status"])["root"],
+        f.ok_in(&a, &["status"])["root"]
     );
+    let shards = std::fs::read_dir(f.home.join("roots"))
+        .expect("roots dir")
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "sqlite"))
+        .count();
+    assert_eq!(shards, 1, "the gitlink has no index of its own");
 }
 
 #[test]
-fn outline_reaches_a_nested_member_outside_the_start_directory() {
+fn outline_reaches_a_gitlink_outside_the_start_directory() {
     let f = aggregate();
     f.write("A/src/top.ts", "export function top() {}\n");
     let src = f.path("A/src");
@@ -74,7 +67,7 @@ fn outline_reaches_a_nested_member_outside_the_start_directory() {
 }
 
 #[test]
-fn a_member_only_root_includes_its_own_members_in_stale_queries() {
+fn a_gitlink_inside_a_gitlink_is_indexed() {
     let f = Fixture::new();
     f.write("A/C/G/g.ts", "export function grandFn() {}\n");
     f.git("A/C/G", &["init", "-q"]);
@@ -88,10 +81,9 @@ fn a_member_only_root_includes_its_own_members_in_stale_queries() {
     f.git("A", &["init", "-q"]);
     f.git("A", &["add", "main.ts", "C"]);
     f.git("A", &["commit", "-qm", "aggregate"]);
-    f.ok_in(&f.path("A"), &["index"]);
     assert_eq!(
-        paths(&f.ok_in(&f.path("A/C"), &["symbols", "grandFn", "--stale-ok"])),
-        strings(&["G/g.ts"])
+        paths(&f.ok_in(&f.path("A"), &["symbols", "grandFn"])),
+        strings(&["C/G/g.ts"])
     );
 }
 
@@ -121,10 +113,17 @@ fn removed_gitlink_and_prune() {
 }
 
 #[test]
-fn parent_lanternignore_on_the_gitlink_drops_the_member() {
+fn child_lanternignore_applies_to_the_child_and_a_parent_rule_drops_the_gitlink() {
     let f = aggregate();
     let a = f.path("A");
+    f.write("A/C/extra.ts", "export function extraFn() {}\n");
+    f.write("A/C/.lanternignore", "extra.ts\n");
+    assert!(names(&f.ok_in(&a, &["symbols", "extraFn"])).is_empty());
+    assert_eq!(
+        names(&f.ok_in(&a, &["symbols", "childFn"])),
+        strings(&["childFn"])
+    );
+
     f.write("A/.lanternignore", "C\n");
-    assert_eq!(count(&f.ok_in(&a, &["index"]), "members"), 1);
     assert!(names(&f.ok_in(&a, &["symbols", "childFn"])).is_empty());
 }

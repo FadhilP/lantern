@@ -97,22 +97,6 @@ fn incomplete_inventory_keeps_committed_content_then_recovers() {
 }
 
 #[test]
-fn verify_interval_zero_rereads_content() {
-    let f = Fixture::new();
-    for name in ["a", "b", "c"] {
-        f.write(&format!("{name}.ts"), format!("export const {name} = 1;\n"));
-    }
-    f.ok(&["index"]);
-    let warm = f.ok(&["index"]);
-    assert_eq!((count(&warm, "changed"), count(&warm, "reused")), (0, 0));
-    let reread = f.ok(&["--verify-interval", "0", "index"]);
-    assert_eq!(
-        (count(&reread, "changed"), count(&reread, "reused")),
-        (0, 3)
-    );
-}
-
-#[test]
 fn work_limits_fail_without_publishing() {
     if !cfg!(debug_assertions) {
         return;
@@ -314,7 +298,7 @@ fn files_out_of_parse_retries_stay_visible_until_a_rebuild() {
     assert_eq!(count(&refreshed, "unparsed_files"), 1);
     let status = f.ok(&["status"]);
     assert_eq!(count(&status, "unparsed_files"), 1);
-    assert_eq!(status["members"][0]["unparsed_files"], 1);
+    assert_eq!(status["unparsed_files"], 1);
     for args in [
         &["symbols", "lost"][..],
         &["refs", "lost"],

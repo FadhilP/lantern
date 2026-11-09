@@ -1,4 +1,4 @@
-//! Queries over the member shards of one workspace.
+//! Queries over the shard of one root.
 
 pub(crate) mod code;
 pub(crate) mod graph;
@@ -15,8 +15,8 @@ use crate::home::Home;
 use crate::language::Language;
 use crate::limits::{MAX_LIMIT, MAX_QUERY_CHARS};
 use crate::paths;
-use crate::store::catalog::Workspace;
 use crate::store::shard;
+use crate::workspace::Resolved;
 
 /// Whether a query refreshed first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -36,13 +36,15 @@ pub struct PageRequest {
 }
 
 /// One page of results.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct Page<T> {
     pub freshness: Freshness,
     pub indexed_at: Option<i64>,
     pub rows: Vec<T>,
     pub next_cursor: Option<String>,
-    #[serde(skip)]
+    /// Files whose symbols are missing because parsing ran out of time; counted only for an
+    /// empty page.
+    pub unparsed_files: u64,
     cursor: CursorBase,
 }
 
@@ -58,99 +60,55 @@ impl<T> Page<T> {
 struct CursorBase {
     offset: usize,
     query: String,
-    generations: String,
+    state: String,
 }
 
 impl CursorBase {
     fn encode(&self, offset: usize) -> String {
-        format!("{offset}.{}.{}", self.query, self.generations)
+        format!("{offset}.{}.{}", self.query, self.state)
     }
 }
 
-/// An open workspace, restricted to the members that intersect the query scope.
+/// The shard of one root, open for one query.
 #[derive(Debug)]
 pub(crate) struct Opened {
-    pub members: Vec<Member>,
+    pub conn: Connection,
+    /// The start directory relative to the root; results outside it are dropped.
+    pub scope: String,
     pub freshness: Freshness,
     pub indexed_at: Option<i64>,
-    generations: String,
+    /// The root and its generation; a cursor from another state is stale.
+    state: String,
 }
 
-#[derive(Debug)]
-pub(crate) struct Member {
-    pub prefix: String,
-    /// The query scope relative to this member's root.
-    pub scope: String,
-    pub conn: Connection,
-}
-
-impl Member {
-    /// The workspace-relative path of `path` when it passes the scope and the glob.
-    pub fn accept(&self, path: &str, filter: &PathFilter) -> Option<String> {
-        if !paths::is_within(path, &self.scope) {
-            return None;
-        }
-        let full = paths::join(&self.prefix, path);
-        filter.matches(&full).then_some(full)
-    }
-
-    /// The member-relative path of a workspace-relative path.
-    pub fn local<'path>(&self, full: &'path str) -> Option<&'path str> {
-        paths::strip_dir(full, &self.prefix)
-    }
-}
-
-pub(crate) fn open(
-    home: &Home,
-    workspace: &Workspace,
-    scope: &str,
-    freshness: Freshness,
-) -> Result<Opened> {
-    let mut members = Vec::new();
-    let mut indexed_at = None;
-    let mut hasher = blake3::Hasher::new();
-    for member in &workspace.members {
-        let member_scope = if let Some(inner) = paths::strip_dir(scope, &member.prefix) {
-            inner.to_owned()
-        } else if paths::is_within(&member.prefix, scope) {
-            String::new()
-        } else {
-            continue;
-        };
-        let not_indexed = || {
-            Error::failure(format!(
-                "{} is not indexed; run `lantern index`",
-                member.root.root
-            ))
-        };
-        let conn = shard::open_existing(&home.roots_dir().join(&member.root.shard))?
-            .ok_or_else(not_indexed)?;
-        // One read transaction per shard, so every statement of the query sees one commit.
-        conn.execute_batch("BEGIN")?;
-        let meta = shard::meta(&conn)?.ok_or_else(not_indexed)?;
-        indexed_at = indexed_at.max(meta.indexed_at);
-        hasher.update(
-            format!(
-                "{}\0{}\0{}\0",
-                member.prefix, member.root.root_key, meta.generation
-            )
-            .as_bytes(),
-        );
-        members.push(Member {
-            prefix: member.prefix.clone(),
-            scope: member_scope,
-            conn,
-        });
-    }
+pub(crate) fn open(home: &Home, resolved: &Resolved, freshness: Freshness) -> Result<Opened> {
+    let target = &resolved.target;
+    let not_indexed = || {
+        Error::failure(format!(
+            "{} is not indexed; run `lantern index` first",
+            target.root.display()
+        ))
+    };
+    let conn = shard::open_existing(&home.shard_path(&target.root_key))?.ok_or_else(not_indexed)?;
+    // One read transaction, so every statement of the query sees one commit.
+    conn.execute_batch("BEGIN")?;
+    let meta = shard::meta(&conn)?.ok_or_else(not_indexed)?;
+    let state = format!("{}\0{}", meta.root_key, meta.generation);
     Ok(Opened {
-        members,
+        conn,
+        scope: resolved.scope.clone(),
         freshness,
-        indexed_at,
-        generations: hasher.finalize().to_hex()[..16].to_owned(),
+        indexed_at: meta.indexed_at,
+        state: blake3::hash(state.as_bytes()).to_hex()[..16].to_owned(),
     })
 }
 
 impl Opened {
+    /// True when `path` passes the scope and the glob.
+    pub fn accept(&self, path: &str, filter: &PathFilter) -> bool {
+        paths::is_within(path, &self.scope) && filter.matches(path)
+    }
+
     /// Decodes the request cursor and checks it belongs to this query and index state.
     fn start(&self, query: &str, request: &PageRequest) -> Result<CursorBase> {
         let query = blake3::hash(query.as_bytes()).to_hex()[..16].to_owned();
@@ -158,7 +116,7 @@ impl Opened {
             None => 0,
             Some(cursor) => {
                 let mut parts = cursor.splitn(3, '.');
-                let (Some(offset), Some(for_query), Some(generations)) =
+                let (Some(offset), Some(for_query), Some(state)) =
                     (parts.next(), parts.next(), parts.next())
                 else {
                     return Err(Error::usage("invalid cursor"));
@@ -167,7 +125,7 @@ impl Opened {
                 if for_query != query {
                     return Err(Error::usage("the cursor belongs to a different query"));
                 }
-                if generations != self.generations {
+                if state != self.state {
                     return Err(Error::new(
                         ErrorKind::StaleCursor,
                         "results changed; run the query again without --cursor",
@@ -179,7 +137,7 @@ impl Opened {
         Ok(CursorBase {
             offset,
             query,
-            generations: self.generations.clone(),
+            state: self.state.clone(),
         })
     }
 
@@ -190,11 +148,17 @@ impl Opened {
         let next_cursor =
             (rows.len() > request.limit).then(|| cursor.encode(cursor.offset + request.limit));
         rows.truncate(request.limit);
+        let unparsed_files = if rows.is_empty() {
+            shard::unparsed_files(&self.conn)?
+        } else {
+            0
+        };
         Ok(Page {
             freshness: self.freshness,
             indexed_at: self.indexed_at,
             rows,
             next_cursor,
+            unparsed_files,
             cursor,
         })
     }

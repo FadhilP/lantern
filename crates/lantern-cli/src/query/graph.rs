@@ -1,7 +1,8 @@
-//! `graph`: what calls X, and what does X call? Edges are resolved by name across every member.
+//! `graph`: what calls X, and what does X call? Edges are resolved by name.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
+use clap::ValueEnum;
 use rusqlite::params;
 use serde::Serialize;
 
@@ -11,12 +12,12 @@ use crate::extract::{RefKind, SymbolKind};
 use crate::language::FileFlags;
 use crate::limits::{MAX_GRAPH_DEPTH, MAX_GRAPH_NODES};
 use crate::query::Freshness;
+use crate::store::shard;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
 pub enum Direction {
     Callers,
     Callees,
-    #[default]
     Both,
 }
 
@@ -43,6 +44,10 @@ pub struct Graph {
     pub truncated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unresolved: Vec<String>,
+    /// Files whose symbols are missing because parsing ran out of time; counted only for an
+    /// empty graph.
+    #[serde(skip)]
+    pub unparsed_files: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -65,16 +70,32 @@ pub struct Edge {
     pub line: u32,
 }
 
-/// A graph vertex: a definition, or a file for top-level references.
+/// A graph vertex.
+#[derive(Debug, Clone)]
+enum Vertex {
+    Definition(Definition),
+    /// The calls outside any definition in the file at this path.
+    File(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum Key {
-    Symbol { member: usize, id: i64 },
-    File { member: usize, path: String },
+enum VertexKey {
+    Symbol(i64),
+    File(String),
+}
+
+impl Vertex {
+    fn key(&self) -> VertexKey {
+        match self {
+            Self::Definition(definition) => VertexKey::Symbol(definition.id),
+            Self::File(path) => VertexKey::File(path.clone()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 struct Definition {
-    key: Key,
+    id: i64,
     name: String,
     container: Option<String>,
     kind: SymbolKind,
@@ -88,7 +109,7 @@ struct Builder<'graph> {
     filter: &'graph PathFilter,
     include_generated: bool,
     max_nodes: usize,
-    ids: HashMap<Key, usize>,
+    ids: HashMap<VertexKey, usize>,
     nodes: Vec<Node>,
     definitions: HashMap<usize, Definition>,
     edges: Vec<Edge>,
@@ -98,7 +119,7 @@ struct Builder<'graph> {
     by_name: HashMap<String, Vec<Definition>>,
 }
 
-pub(crate) fn run(opened: &Opened, scope: &str, query: &GraphQuery) -> Result<Graph> {
+pub(crate) fn run(opened: &Opened, query: &GraphQuery) -> Result<Graph> {
     validate_text("the name", &query.name)?;
     if query.depth == 0 || query.depth > MAX_GRAPH_DEPTH {
         return Err(Error::usage(format!(
@@ -110,7 +131,7 @@ pub(crate) fn run(opened: &Opened, scope: &str, query: &GraphQuery) -> Result<Gr
             "--max-nodes must be between 1 and {MAX_GRAPH_NODES}"
         )));
     }
-    let filter = PathFilter::new(&query.path, scope)?;
+    let filter = PathFilter::new(&query.path, &opened.scope)?;
     let mut builder = Builder {
         opened,
         filter: &filter,
@@ -131,7 +152,7 @@ pub(crate) fn run(opened: &Opened, scope: &str, query: &GraphQuery) -> Result<Gr
         if query.kind.is_some_and(|kind| kind != definition.kind) {
             continue;
         }
-        if let Some(id) = builder.node(&definition) {
+        if let Some(id) = builder.node(&Vertex::Definition(definition)) {
             roots.push(id);
         }
     }
@@ -157,6 +178,11 @@ pub(crate) fn run(opened: &Opened, scope: &str, query: &GraphQuery) -> Result<Gr
         }
     }
 
+    let unparsed_files = if builder.nodes.is_empty() {
+        shard::unparsed_files(&opened.conn)?
+    } else {
+        0
+    };
     Ok(Graph {
         freshness: opened.freshness,
         indexed_at: opened.indexed_at,
@@ -166,13 +192,15 @@ pub(crate) fn run(opened: &Opened, scope: &str, query: &GraphQuery) -> Result<Gr
         edges: builder.edges,
         truncated: builder.truncated,
         unresolved: builder.unresolved.into_iter().collect(),
+        unparsed_files,
     })
 }
 
 impl Builder<'_> {
     /// The node id of a vertex, adding it unless the node cap is reached.
-    fn node(&mut self, definition: &Definition) -> Option<usize> {
-        if let Some(&id) = self.ids.get(&definition.key) {
+    fn node(&mut self, vertex: &Vertex) -> Option<usize> {
+        let key = vertex.key();
+        if let Some(&id) = self.ids.get(&key) {
             return Some(id);
         }
         if self.nodes.len() >= self.max_nodes {
@@ -180,68 +208,60 @@ impl Builder<'_> {
             return None;
         }
         let id = self.nodes.len();
-        let kind = match definition.key {
-            Key::Symbol { .. } => definition.kind.as_str(),
-            Key::File { .. } => "file",
-        };
-        self.nodes.push(Node {
-            id,
-            name: definition.name.clone(),
-            container: definition.container.clone(),
-            kind,
-            path: definition.path.clone(),
-            line: definition.line,
+        self.nodes.push(match vertex {
+            Vertex::Definition(definition) => Node {
+                id,
+                name: definition.name.clone(),
+                container: definition.container.clone(),
+                kind: definition.kind.as_str(),
+                path: definition.path.clone(),
+                line: definition.line,
+            },
+            Vertex::File(path) => Node {
+                id,
+                name: path.clone(),
+                container: None,
+                kind: "file",
+                path: path.clone(),
+                line: 1,
+            },
         });
-        self.ids.insert(definition.key.clone(), id);
-        if matches!(definition.key, Key::Symbol { .. }) {
+        self.ids.insert(key, id);
+        if let Vertex::Definition(definition) = vertex {
             self.definitions.insert(id, definition.clone());
         }
         Some(id)
     }
 
-    /// Every non-generated definition of `name` in every member, in path order.
+    /// Every non-generated definition of `name`, in path order.
     fn definitions_named(&mut self, name: &str) -> Result<Vec<Definition>> {
         if let Some(found) = self.by_name.get(name) {
             return Ok(found.clone());
         }
-        let mut found = Vec::new();
-        for (index, member) in self.opened.members.iter().enumerate() {
-            // Every path of a shared blob, so the first one in scope names the definition.
-            let mut statement = member.conn.prepare_cached(
-                "SELECT s.id, s.kind, s.container, s.line, f.path, f.flags
-                 FROM names n JOIN symbols s ON s.name_id = n.id
-                 JOIN files f ON f.blob_id = s.blob_id AND (?2 OR f.flags & 1 = 0)
-                 WHERE n.name = ?1 ORDER BY s.id, f.path",
-            )?;
-            let rows = statement.query_map(params![name, self.include_generated], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, SymbolKind>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, u32>(3)?,
-                    row.get::<_, String>(4)?,
-                    FileFlags(row.get(5)?),
-                ))
-            })?;
-            let mut placed = HashSet::new();
-            for row in rows {
-                let (id, kind, container, line, path, flags) = row?;
-                if placed.contains(&id) {
-                    continue;
-                }
-                let Some(path) = member.accept(&path, self.filter) else {
-                    continue;
-                };
-                placed.insert(id);
-                found.push(Definition {
-                    key: Key::Symbol { member: index, id },
-                    name: name.to_owned(),
-                    container,
-                    kind,
-                    path,
-                    line,
-                    test: flags.is_test(),
-                });
+        // Every path of a shared blob, so the first one in scope names the definition.
+        let mut statement = self.opened.conn.prepare_cached(
+            "SELECT s.id, s.kind, s.container, s.line, f.path, f.flags
+             FROM names n JOIN symbols s ON s.name_id = n.id
+             JOIN files f ON f.blob_id = s.blob_id AND (?2 OR f.flags & 1 = 0)
+             WHERE n.name = ?1 ORDER BY s.id, f.path",
+        )?;
+        let rows = statement.query_map(params![name, self.include_generated], |row| {
+            Ok(Definition {
+                id: row.get(0)?,
+                name: name.to_owned(),
+                kind: row.get(1)?,
+                container: row.get(2)?,
+                line: row.get(3)?,
+                path: row.get(4)?,
+                test: FileFlags(row.get(5)?).is_test(),
+            })
+        })?;
+        let mut found: Vec<Definition> = Vec::new();
+        for row in rows {
+            let definition = row?;
+            let placed = found.last().is_some_and(|last| last.id == definition.id);
+            if !placed && self.opened.accept(&definition.path, self.filter) {
+                found.push(definition);
             }
         }
         found.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
@@ -251,62 +271,49 @@ impl Builder<'_> {
 
     /// Calls to the definition's name, grouped by the definition that contains each one.
     fn callers(&mut self, target: usize, definition: &Definition) -> Result<Vec<usize>> {
+        let mut statement = self.opened.conn.prepare_cached(
+            "SELECT r.kind, r.line, f.path, es.id, en.name, es.kind, es.container, es.line, f.flags
+             FROM names n JOIN refs r ON r.name_id = n.id
+             JOIN files f ON f.blob_id = r.blob_id AND (?2 OR f.flags & 1 = 0)
+             LEFT JOIN symbols es ON es.id = r.enclosing
+             LEFT JOIN names en ON en.id = es.name_id
+             WHERE n.name = ?1 AND r.kind = 'call'",
+        )?;
+        let rows =
+            statement.query_map(params![definition.name, self.include_generated], |row| {
+                Ok((
+                    row.get::<_, RefKind>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<SymbolKind>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<u32>>(7)?,
+                    FileFlags(row.get(8)?),
+                ))
+            })?;
         let mut sources = Vec::new();
-        for (index, member) in self.opened.members.iter().enumerate() {
-            let mut statement = member.conn.prepare_cached(
-                "SELECT r.kind, r.line, f.path, es.id, en.name, es.kind, es.container, es.line, f.flags
-                 FROM names n JOIN refs r ON r.name_id = n.id
-                 JOIN files f ON f.blob_id = r.blob_id AND (?2 OR f.flags & 1 = 0)
-                 LEFT JOIN symbols es ON es.id = r.enclosing
-                 LEFT JOIN names en ON en.id = es.name_id
-                 WHERE n.name = ?1 AND r.kind = 'call'",
-            )?;
-            let rows =
-                statement.query_map(params![definition.name, self.include_generated], |row| {
-                    Ok((
-                        row.get::<_, RefKind>(0)?,
-                        row.get::<_, u32>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<i64>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, Option<SymbolKind>>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                        row.get::<_, Option<u32>>(7)?,
-                        FileFlags(row.get(8)?),
-                    ))
-                })?;
-            for row in rows {
-                let (kind, line, path, symbol, name, symbol_kind, container, symbol_line, flags) =
-                    row?;
-                let Some(path) = member.accept(&path, self.filter) else {
-                    continue;
-                };
-                let source = match (symbol, name, symbol_kind) {
-                    (Some(id), Some(name), Some(kind)) => Definition {
-                        key: Key::Symbol { member: index, id },
-                        name,
-                        container,
-                        kind,
-                        path: path.clone(),
-                        line: symbol_line.unwrap_or(line),
-                        test: flags.is_test(),
-                    },
-                    _ => Definition {
-                        key: Key::File {
-                            member: index,
-                            path: path.clone(),
-                        },
-                        name: path.clone(),
-                        container: None,
-                        kind: SymbolKind::Module,
-                        path: path.clone(),
-                        line: 1,
-                        test: flags.is_test(),
-                    },
-                };
-                sources.push((source, kind, path, line));
+        for row in rows {
+            let (kind, line, path, symbol, name, symbol_kind, container, symbol_line, flags) = row?;
+            if !self.opened.accept(&path, self.filter) {
+                continue;
             }
+            let source = match (symbol, name, symbol_kind) {
+                (Some(id), Some(name), Some(kind)) => Vertex::Definition(Definition {
+                    id,
+                    name,
+                    container,
+                    kind,
+                    path: path.clone(),
+                    line: symbol_line.unwrap_or(line),
+                    test: flags.is_test(),
+                }),
+                _ => Vertex::File(path.clone()),
+            };
+            sources.push((source, kind, path, line));
         }
+        drop(statement);
         sources.sort_by(|a, b| (&a.2, a.3).cmp(&(&b.2, b.3)));
         let mut added = Vec::new();
         for (source, kind, _, line) in sources {
@@ -322,19 +329,16 @@ impl Builder<'_> {
     /// Calls whose innermost definition is this one, resolved by name; code outside tests
     /// never resolves to a definition in a test file.
     fn callees(&mut self, source: usize, definition: &Definition) -> Result<Vec<usize>> {
-        let Key::Symbol { member, id } = definition.key else {
-            return Ok(Vec::new());
-        };
-        let conn = &self.opened.members[member].conn;
-        let mut statement = conn.prepare_cached(
+        let mut statement = self.opened.conn.prepare_cached(
             "SELECT n.name, r.kind, r.line FROM refs r JOIN names n ON n.id = r.name_id
              WHERE r.enclosing = ?1 AND r.kind = 'call' ORDER BY r.line, r.col",
         )?;
         let calls: Vec<(String, RefKind, u32)> = statement
-            .query_map(params![id], |row| {
+            .query_map(params![definition.id], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
             .collect::<rusqlite::Result<_>>()?;
+        drop(statement);
         let mut added = Vec::new();
         for (name, kind, line) in calls {
             let mut targets = self.definitions_named(&name)?;
@@ -346,7 +350,7 @@ impl Builder<'_> {
                 continue;
             }
             for target in targets {
-                let Some(to) = self.node(&target) else {
+                let Some(to) = self.node(&Vertex::Definition(target)) else {
                     return Ok(added);
                 };
                 self.edge(source, to, kind, line);

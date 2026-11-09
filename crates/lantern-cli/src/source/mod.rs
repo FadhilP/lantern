@@ -18,7 +18,7 @@ use crate::language::FileFlags;
 use crate::limits::{MAX_RULE_FILE_BYTES, MAX_RULE_TOTAL_BYTES};
 use crate::rules::{self, ScopedRules};
 
-pub(crate) use git::open_worktree;
+pub(crate) use git::is_gitlink;
 
 /// Where a root's file list comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -63,8 +63,6 @@ pub(crate) struct Inventory {
     pub files: BTreeMap<String, Entry>,
     /// Hash of every `.lanternignore` file; part of the root's policy.
     pub rules_digest: String,
-    /// Gitlink paths that the root's rules keep.
-    pub gitlinks: Vec<String>,
     pub head: Option<String>,
     pub branch: Option<String>,
 }

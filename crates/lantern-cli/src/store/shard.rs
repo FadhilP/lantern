@@ -1,4 +1,4 @@
-//! One shard per physical root: blobs, trigram index, names, symbols, references, files.
+//! One shard per root: blobs, trigram index, names, symbols, references, files.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -8,6 +8,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
 use crate::extract::Extraction;
+use crate::fsmeta::{EntryKind, Stat};
 use crate::source::SourceKind;
 
 const SCHEMA: &str = r"
@@ -17,6 +18,8 @@ CREATE TABLE meta (
   policy TEXT NOT NULL,
   extractor TEXT NOT NULL,
   indexed_at INTEGER, generation INTEGER NOT NULL DEFAULT 0,
+  -- When the last committed refresh started its inventory; see `refresh::settled`.
+  scanned_at INTEGER NOT NULL,
   checkpoint_pending INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE blobs (
@@ -67,14 +70,12 @@ CREATE INDEX refs_enclosing ON refs(enclosing);
 CREATE TABLE files (
   path TEXT PRIMARY KEY,
   blob_id INTEGER REFERENCES blobs,
-  size INTEGER NOT NULL,
   flags INTEGER NOT NULL,
-  identity TEXT NOT NULL,
-  fingerprint TEXT NOT NULL,
-  verified_at INTEGER NOT NULL
+  device INTEGER NOT NULL, inode INTEGER NOT NULL, size INTEGER NOT NULL,
+  -- In the platform's unit; see `fsmeta::Stat`.
+  modified INTEGER NOT NULL, changed INTEGER NOT NULL
 ) WITHOUT ROWID;
 CREATE INDEX files_blob ON files(blob_id);
-CREATE INDEX files_identity ON files(identity, fingerprint);
 ";
 
 pub(crate) fn open(path: &Path) -> Result<Connection> {
@@ -84,7 +85,7 @@ pub(crate) fn open(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Opens an existing shard read-only; `None` when the root was never indexed.
+/// Opens an existing shard read-only; `None` when this Lantern never indexed the root.
 pub(crate) fn open_existing(path: &Path) -> Result<Option<Connection>> {
     if !path.exists() {
         return Ok(None);
@@ -103,6 +104,7 @@ pub(crate) struct Meta {
     pub extractor: String,
     pub indexed_at: Option<i64>,
     pub generation: i64,
+    pub scanned_at: i64,
     /// A secure commit whose WAL was not yet emptied.
     pub checkpoint_pending: bool,
 }
@@ -111,7 +113,7 @@ pub(crate) fn meta(conn: &Connection) -> Result<Option<Meta>> {
     let row = conn
         .query_row(
             "SELECT root, root_key, source, head, branch, policy, extractor, indexed_at, generation,
-                    checkpoint_pending
+                    scanned_at, checkpoint_pending
              FROM meta",
             [],
             |row| {
@@ -125,7 +127,8 @@ pub(crate) fn meta(conn: &Connection) -> Result<Option<Meta>> {
                     extractor: row.get(6)?,
                     indexed_at: row.get(7)?,
                     generation: row.get(8)?,
-                    checkpoint_pending: row.get(9)?,
+                    scanned_at: row.get(9)?,
+                    checkpoint_pending: row.get(10)?,
                 })
             },
         )
@@ -137,8 +140,8 @@ pub(crate) fn write_meta(conn: &Connection, meta: &Meta) -> Result<()> {
     conn.execute("DELETE FROM meta", [])?;
     conn.execute(
         "INSERT INTO meta (root, root_key, source, head, branch, policy, extractor, indexed_at, generation,
-           checkpoint_pending)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+           scanned_at, checkpoint_pending)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             meta.root,
             meta.root_key,
@@ -149,6 +152,7 @@ pub(crate) fn write_meta(conn: &Connection, meta: &Meta) -> Result<()> {
             meta.extractor,
             meta.indexed_at,
             meta.generation,
+            meta.scanned_at,
             meta.checkpoint_pending
         ],
     )?;
@@ -158,27 +162,28 @@ pub(crate) fn write_meta(conn: &Connection, meta: &Meta) -> Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileRow {
     pub blob_id: Option<i64>,
-    pub size: i64,
     pub flags: u8,
-    pub identity: String,
-    pub fingerprint: String,
-    pub verified_at: i64,
+    pub stat: Stat,
 }
 
 pub(crate) fn files(conn: &Connection) -> Result<HashMap<String, FileRow>> {
     let mut statement = conn.prepare(
-        "SELECT path, blob_id, size, flags, identity, fingerprint, verified_at FROM files",
+        "SELECT path, blob_id, flags, device, inode, size, modified, changed FROM files",
     )?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
             FileRow {
                 blob_id: row.get(1)?,
-                size: row.get(2)?,
-                flags: row.get(3)?,
-                identity: row.get(4)?,
-                fingerprint: row.get(5)?,
-                verified_at: row.get(6)?,
+                flags: row.get(2)?,
+                stat: Stat {
+                    kind: EntryKind::File,
+                    device: row.get::<_, i64>(3)?.cast_unsigned(),
+                    inode: row.get::<_, i64>(4)?.cast_unsigned(),
+                    size: row.get::<_, i64>(5)?.cast_unsigned(),
+                    modified: row.get(6)?,
+                    changed: row.get(7)?,
+                },
             },
         ))
     })?;
@@ -212,20 +217,21 @@ pub(crate) fn blob_keys(conn: &Connection) -> Result<HashMap<BlobKey, i64>> {
 
 pub(crate) fn upsert_file(conn: &Connection, path: &str, row: &FileRow) -> Result<()> {
     conn.prepare_cached(
-        "INSERT INTO files (path, blob_id, size, flags, identity, fingerprint, verified_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         ON CONFLICT (path) DO UPDATE SET blob_id = excluded.blob_id, size = excluded.size,
-           flags = excluded.flags, identity = excluded.identity,
-           fingerprint = excluded.fingerprint, verified_at = excluded.verified_at",
+        "INSERT INTO files (path, blob_id, flags, device, inode, size, modified, changed)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT (path) DO UPDATE SET blob_id = excluded.blob_id, flags = excluded.flags,
+           device = excluded.device, inode = excluded.inode, size = excluded.size,
+           modified = excluded.modified, changed = excluded.changed",
     )?
     .execute(params![
         path,
         row.blob_id,
-        row.size,
         row.flags,
-        row.identity,
-        row.fingerprint,
-        row.verified_at
+        row.stat.device.cast_signed(),
+        row.stat.inode.cast_signed(),
+        row.stat.size.cast_signed(),
+        row.stat.modified,
+        row.stat.changed
     ])?;
     Ok(())
 }
@@ -434,6 +440,16 @@ pub(crate) fn counts(conn: &Connection) -> Result<Counts> {
             })
         },
     )?)
+}
+
+/// Files with no symbols because their last parse ran out of time.
+pub(crate) fn unparsed_files(conn: &Connection) -> Result<u64> {
+    let count: i64 = conn.query_row(
+        "SELECT count(*) FROM files f JOIN blobs b ON b.id = f.blob_id WHERE b.timeouts > 0",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count.unsigned_abs())
 }
 
 /// Interned identifiers. A secure refresh deletes unused ones.

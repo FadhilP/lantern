@@ -59,7 +59,7 @@ Add `--json` only when a program parses the output. Each command then prints one
 
 ## Command notes
 
-- **symbols**: fuzzy. Ranks exact name, then case-insensitive exact, then prefix, then initials (`gubi` finds `getUserById`), then fuzzy. Narrow with `--kind function|method|class|interface|struct|enum|trait|type|module|constant|variable|field`. Qualify with a container: `UserStore.getUserById` or `Store::get`.
+- **symbols**: matches by exact name, prefix, initials, or substring (3 characters or more); letters with gaps between them do not match. Ranks exact name, then case-insensitive exact, then prefix, then initials (`gubi` finds `getUserById`), then substring. Narrow with `--kind function|method|class|interface|struct|enum|trait|type|module|constant|variable|field`. Qualify with a container: `UserStore.getUserById` or `Store::get`.
 - **code**: literal and case-insensitive by default. For a pattern that starts with `-`, use `-e`: `lantern code -e "--flag"`. Add `--regex` for a Rust-syntax regex and `--case-sensitive` when case matters. Matching is per line. `--sort path` gives a stable order instead of relevance.
 - **refs**: exact, case-sensitive name. `--kind call|type|import|implementation`. `enclosing` names the definition that contains the reference.
 - **graph**: `--direction callers|callees|both`. It follows calls only; use `refs` for type uses, imports, and `extends`/`implements`. A node with kind `file` stands for calls outside any definition. Names in `unresolved` have no definition in the index (often library calls). Code outside tests never resolves to a definition in a test file.
@@ -70,7 +70,7 @@ Add `--json` only when a program parses the output. Each command then prints one
 - **Name resolution, not types.** `refs` and `graph` link by name (`"resolution": "name"`). Two unrelated functions with the same name share references and edges. Check the node paths before you trust an edge; narrow with `--path` or `--kind`.
 - **Generated files** (lockfiles, files marked `linguist-generated` or `linguist-vendored` in `.gitattributes`) are left out of `symbols`, `refs`, and `graph`, and ranked last in `code`. Add `--include-generated` to include them.
 - **What is indexed.** In a Git repository: tracked files plus untracked files that Git does not ignore. Outside Git: all files except `.gitignore` matches and the defaults (dot-files, `node_modules/`, `dist/`, `build/`, `coverage/`, `target/`, `vendor/`). `.lanternignore` (gitignore syntax) excludes more in both. Files over 1 MiB (`--max-file-size`) and binary files are not searchable as text.
-- **Nested repositories** (submodules that are checked out) are part of the workspace; their paths carry the submodule prefix.
+- **Nested repositories** (submodules that are checked out) are indexed with the repository that contains them; their paths carry the submodule prefix.
 
 ## Handle errors
 
@@ -82,7 +82,7 @@ Errors go to stderr as `lantern: <message>` (with `--json`: `{"error":{"code":".
 | 2 | `usage` | Fix the arguments (bad flag, limit, glob, cursor from another query, `--max-bytes` too small). |
 | 3 | `root_moved` | A folder that was indexed alone is now inside a Git repository. Run from the intended root. |
 | 4 | `stale_cursor` | The index changed between pages. Run the query again without `--cursor`. |
-| 75 | `temporary` | Another refresh holds the lock, files kept changing, or a reader blocked cleanup. Retry after a short wait. |
+| 75 | `temporary` | Another refresh holds the lock, files kept changing, or (`index` only) a reader blocked cleanup. Retry after a short wait. |
 
 ## Speed
 

@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use clap::ValueEnum;
 use rayon::prelude::*;
 use regex::{Regex, RegexBuilder};
 use regex_syntax::hir::{Hir, HirKind};
@@ -18,10 +19,9 @@ use crate::language::FileFlags;
 use crate::limits::{MAX_CONTEXT, MAX_LINE_CHARS, MAX_PER_FILE};
 use crate::store::shard;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
 pub enum CodeSort {
     /// Non-generated files first, then trigram rank, then path.
-    #[default]
     Relevance,
     Path,
 }
@@ -61,7 +61,6 @@ pub struct LineMatch {
 
 #[derive(Debug)]
 struct Candidate {
-    member: usize,
     blob_id: i64,
     path: String,
     generated: bool,
@@ -75,7 +74,6 @@ const VERIFY_BATCH: usize = 64;
 
 pub(crate) fn run(
     opened: &Opened,
-    scope: &str,
     query: &CodeQuery,
     request: &PageRequest,
 ) -> Result<Page<CodeHit>> {
@@ -91,7 +89,7 @@ pub(crate) fn run(
             "--context must be at most {MAX_CONTEXT}"
         )));
     }
-    let filter = PathFilter::new(&query.path, scope)?;
+    let filter = PathFilter::new(&query.path, &opened.scope)?;
     let languages = language_names(query.language.as_deref())?;
     let source = if query.regex {
         query.pattern.clone()
@@ -104,54 +102,47 @@ pub(crate) fn run(
         .crlf(true)
         .build()
         .map_err(|error| Error::usage(format!("invalid regex: {error}")))?;
-    let description = format!("code:{query:?}:{scope}");
+    let description = format!("code:{query:?}:{}", opened.scope);
     let needed = opened.needed(&description, request)?;
     let fts = fts_query(&query.pattern, query.regex);
 
+    let sql = if fts.is_some() {
+        "WITH hits AS MATERIALIZED (
+           SELECT rowid AS id, bm25(blobs_fts) AS score FROM blobs_fts WHERE blobs_fts MATCH ?1)
+         SELECT f.path, f.flags, hits.id, hits.score, b.language
+         FROM hits JOIN files f ON f.blob_id = hits.id JOIN blobs b ON b.id = hits.id"
+    } else {
+        "SELECT f.path, f.flags, f.blob_id, 0.0, b.language
+         FROM files f JOIN blobs b ON b.id = f.blob_id WHERE ?1 IS NULL"
+    };
+    let mut statement = opened.conn.prepare(sql)?;
+    let rows = statement.query_map([fts.as_deref()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, u8>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, f64>(3)?,
+            row.get::<_, Option<String>>(4)?,
+        ))
+    })?;
     let mut candidates = Vec::new();
-    for (index, member) in opened.members.iter().enumerate() {
-        let sql = if fts.is_some() {
-            "WITH hits AS MATERIALIZED (
-               SELECT rowid AS id, bm25(blobs_fts) AS score FROM blobs_fts WHERE blobs_fts MATCH ?1)
-             SELECT f.path, f.flags, hits.id, hits.score, b.language
-             FROM hits JOIN files f ON f.blob_id = hits.id JOIN blobs b ON b.id = hits.id"
-        } else {
-            "SELECT f.path, f.flags, f.blob_id, 0.0, b.language
-             FROM files f JOIN blobs b ON b.id = f.blob_id WHERE ?1 IS NULL"
-        };
-        let mut statement = member.conn.prepare(sql)?;
-        let rows = statement.query_map([fts.as_deref()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, u8>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, f64>(3)?,
-                row.get::<_, Option<String>>(4)?,
-            ))
-        })?;
-        for row in rows {
-            let (path, flags, blob_id, score, language) = row?;
-            // Generated files rank last unless the caller includes them as ordinary files.
-            let generated = FileFlags(flags).is_generated() && !query.include_generated;
-            let language_ok = languages.as_ref().is_none_or(|names| {
-                language
-                    .as_deref()
-                    .is_some_and(|language| names.contains(&language))
-            });
-            if !language_ok {
-                continue;
-            }
-            let Some(path) = member.accept(&path, &filter) else {
-                continue;
-            };
-            candidates.push(Candidate {
-                member: index,
-                blob_id,
-                path,
-                generated,
-                score,
-            });
+    for row in rows {
+        let (path, flags, blob_id, score, language) = row?;
+        let language_ok = languages.as_ref().is_none_or(|names| {
+            language
+                .as_deref()
+                .is_some_and(|language| names.contains(&language))
+        });
+        if !language_ok || !opened.accept(&path, &filter) {
+            continue;
         }
+        candidates.push(Candidate {
+            blob_id,
+            path,
+            // Generated files rank last unless the caller includes them as ordinary files.
+            generated: FileFlags(flags).is_generated() && !query.include_generated,
+            score,
+        });
     }
     match query.sort {
         CodeSort::Relevance => candidates.sort_by(|a, b| {
@@ -163,34 +154,34 @@ pub(crate) fn run(
         CodeSort::Path => candidates.sort_by(|a, b| a.path.cmp(&b.path)),
     }
 
-    let mut cache: HashMap<(usize, i64), Found> = HashMap::new();
+    let mut cache: HashMap<i64, Found> = HashMap::new();
     let mut hits = Vec::new();
     for batch in candidates.chunks(VERIFY_BATCH) {
-        let mut pending: Vec<((usize, i64), Vec<u8>)> = Vec::new();
+        let mut pending: Vec<(i64, Vec<u8>)> = Vec::new();
         for candidate in batch {
-            let key = (candidate.member, candidate.blob_id);
-            if cache.contains_key(&key) || pending.iter().any(|(seen, _)| *seen == key) {
+            let blob_id = candidate.blob_id;
+            if cache.contains_key(&blob_id) || pending.iter().any(|(seen, _)| *seen == blob_id) {
                 continue;
             }
-            let compressed: Vec<u8> = opened.members[candidate.member]
+            let compressed: Vec<u8> = opened
                 .conn
                 .prepare_cached("SELECT content FROM blobs WHERE id = ?1")?
-                .query_row([candidate.blob_id], |row| row.get(0))?;
-            pending.push((key, compressed));
+                .query_row([blob_id], |row| row.get(0))?;
+            pending.push((blob_id, compressed));
         }
-        let verified: Vec<((usize, i64), Found)> = pending
+        let verified: Vec<(i64, Found)> = pending
             .into_par_iter()
-            .map(|(key, compressed)| {
+            .map(|(blob_id, compressed)| {
                 let text = shard::decompress(&compressed)?;
                 Ok((
-                    key,
+                    blob_id,
                     search(&text, &matcher, query.per_file, query.context).map(Arc::new),
                 ))
             })
             .collect::<Result<_>>()?;
         cache.extend(verified);
         for candidate in batch {
-            if let Some(found) = &cache[&(candidate.member, candidate.blob_id)] {
+            if let Some(found) = &cache[&candidate.blob_id] {
                 hits.push(CodeHit {
                     path: candidate.path.clone(),
                     match_count: found.0,

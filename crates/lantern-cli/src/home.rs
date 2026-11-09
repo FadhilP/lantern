@@ -1,4 +1,4 @@
-//! The data directory: catalog, shards, locks, and the folder default excludes.
+//! The data directory: shards, locks, and the folder default excludes.
 
 use std::fs::{self, File, TryLockError};
 use std::path::{Path, PathBuf};
@@ -37,10 +37,6 @@ impl Home {
 
     pub fn dir(&self) -> &Path {
         &self.dir
-    }
-
-    pub fn catalog_path(&self) -> PathBuf {
-        self.dir.join("catalog.sqlite")
     }
 
     pub fn defaults_path(&self) -> PathBuf {

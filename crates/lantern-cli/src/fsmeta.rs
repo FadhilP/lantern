@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::error::{Error, Result};
 use crate::limits::TEXT_SNIFF_BYTES;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum EntryKind {
     File,
     Dir,
@@ -16,15 +16,17 @@ pub(crate) enum EntryKind {
 }
 
 /// What `lstat` (or `fstat`) reports about one path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Stat {
     pub kind: EntryKind,
     /// Device and inode, or volume serial and file index.
     pub device: u64,
     pub inode: u64,
     pub size: u64,
-    pub modified_ns: i128,
-    pub changed_ns: i128,
+    /// Modification and change times in the platform's unit: nanoseconds since 1970 on Unix,
+    /// 100 ns ticks since 1601 on Windows.
+    pub modified: i64,
+    pub changed: i64,
 }
 
 impl Stat {
@@ -35,17 +37,21 @@ impl Stat {
             device: 0,
             inode: 0,
             size: 0,
-            modified_ns: 0,
-            changed_ns: 0,
+            modified: 0,
+            changed: 0,
         }
     }
 
-    pub fn identity(&self) -> String {
-        format!("{:x}:{:x}", self.device, self.inode)
-    }
-
-    pub fn fingerprint(&self) -> String {
-        format!("{}:{}:{}", self.size, self.modified_ns, self.changed_ns)
+    /// The later of the modification and change times, in milliseconds since the Unix epoch.
+    pub fn last_change_ms(&self) -> i64 {
+        let latest = self.modified.max(self.changed);
+        if cfg!(windows) {
+            const TICKS_PER_MS: i64 = 10_000;
+            const MS_FROM_1601_TO_1970: i64 = 11_644_473_600_000;
+            latest / TICKS_PER_MS - MS_FROM_1601_TO_1970
+        } else {
+            latest / 1_000_000
+        }
     }
 }
 
@@ -58,11 +64,7 @@ pub(crate) enum Content {
 }
 
 /// Reads `path` and proves it matched `expected` before open, at open, after read, and after close.
-///
-/// # Errors
-///
-/// A [`Temporary`](crate::ErrorKind::Temporary) error when the file changed or vanished, so the refresh
-/// retries; a failure when it cannot be read.
+/// A temporary error when the file changed or vanished, so the refresh retries.
 pub(crate) fn read_stable(path: &Path, expected: &Stat, max_size: u64) -> Result<Content> {
     if expected.size > max_size {
         return Ok(Content::TooLarge);
@@ -132,8 +134,8 @@ mod unix {
             device: meta.dev(),
             inode: meta.ino(),
             size: meta.len(),
-            modified_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
-            changed_ns: i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec()),
+            modified: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+            changed: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
         }
     }
 }
@@ -203,8 +205,7 @@ pub(crate) fn fstat(file: &File) -> io::Result<Stat> {
         device: u64::from(info.dwVolumeSerialNumber),
         inode: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
         size: (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow),
-        // FILETIME ticks are 100 ns.
-        modified_ns: i128::from(basic.LastWriteTime) * 100,
-        changed_ns: i128::from(basic.ChangeTime) * 100,
+        modified: basic.LastWriteTime,
+        changed: basic.ChangeTime,
     })
 }
