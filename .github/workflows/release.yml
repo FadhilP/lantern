@@ -1,0 +1,96 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04, npm: linux-x64-gnu }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, npm: linux-arm64-gnu }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04, npm: linux-x64-musl, musl: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, npm: linux-arm64-musl, musl: true }
+          - { target: x86_64-apple-darwin, os: macos-15-intel, npm: darwin-x64 }
+          - { target: aarch64-apple-darwin, os: macos-latest, npm: darwin-arm64 }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, npm: win32-x64-msvc }
+          - { target: aarch64-pc-windows-msvc, os: windows-11-arm, npm: win32-arm64-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Tag matches the crate version
+        shell: bash
+        run: test "$(cargo pkgid -p lantern-cli | sed 's/.*[@#]//')" = "${GITHUB_REF_NAME#v}"
+      - if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo test --release --locked --target ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p lantern-cli
+      - name: Stage npm package and archive
+        shell: bash
+        run: |
+          exe=lantern; [[ "${{ matrix.target }}" == *windows* ]] && exe=lantern.exe
+          node npm/stage-platform.mjs "${{ matrix.npm }}" "target/${{ matrix.target }}/release/$exe" "${GITHUB_REF_NAME#v}"
+          tar -czf "lantern-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" "$exe"
+      - name: Smoke test through the npm launcher
+        shell: bash
+        run: |
+          mkdir -p smoke
+          # Tarballs install as copies, like the registry; directory installs are symlinks.
+          (cd npm/dist/${{ matrix.npm }} && npm pack --pack-destination ../../../smoke)
+          (cd npm/lantern && npm pack --pack-destination ../../smoke)
+          cd smoke && npm init -y >/dev/null && npm install ./*.tgz --no-save
+          npx lantern status --json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.npm }}
+          path: |
+            npm/dist/${{ matrix.npm }}
+            lantern-${{ matrix.target }}.tar.gz
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # A rerun after a partial release uploads the archives that are missing.
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" artifacts/*/lantern-*.tar.gz --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" artifacts/*/lantern-*.tar.gz --generate-notes
+          fi
+      # Trusted publishing (OIDC): no token. Already published versions are skipped, so a rerun can finish a partial release.
+      - name: npm publish
+        run: |
+          publish() {
+            spec="$(node -p "const p=require('./$1/package.json'); p.name+'@'+p.version")"
+            if npm view "$spec" version >/dev/null 2>&1; then echo "skip $spec"; else npm publish "$1" --access public; fi
+          }
+          # Artifacts lose the executable bit, and npm only restores it for `bin` entries.
+          find artifacts -path '*/bin/lantern' -exec chmod +x {} +
+          for dir in artifacts/*/npm/dist/*; do publish "$dir"; done
+          node npm/stage-platform.mjs --main "${GITHUB_REF_NAME#v}"
+          publish npm/lantern

@@ -1,0 +1,20 @@
+{
+  "name": "@fadhilp/lantern",
+  "version": "0.0.0",
+  "description": "Read-only code discovery for large codebases",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fadhilp/lantern.git"
+  },
+  "bin": {
+    "lantern": "bin/lantern.js"
+  },
+  "files": [
+    "bin",
+    "skills"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {}
+}
