@@ -18,8 +18,6 @@ lantern outline src/user.ts      # What is in this file?
 
 ## Install
 
-> **Note:** The npm package is not published yet, so `npm install` does not work. Until it is, install from source (below).
-
 ```sh
 npm install -g @fadhilp/lantern
 ```
@@ -99,8 +97,6 @@ For Claude Code, copy it into your skills directory:
 mkdir -p ~/.claude/skills/lantern
 cp "$(npm root -g)/@fadhilp/lantern/skills/lantern/SKILL.md" ~/.claude/skills/lantern/
 ```
-
-Until the npm package is published, copy `skills/lantern/SKILL.md` from a clone of this repository instead.
 
 ## Ignoring files
 

@@ -93,8 +93,7 @@ jobs:
           cp -r ../../artifacts/*/npm/lantern/bin/* bin/
           # Artifacts lose the executable bit, and npm only restores it for `bin` entries.
           chmod +x bin/*/lantern
-          cp -r ../../skills .
-          cp ../../LICENSE .
+          cp -r ../../skills ../../README.md ../../LICENSE .
           npm pkg set version="${GITHUB_REF_NAME#v}"
           if npm view "@fadhilp/lantern@${GITHUB_REF_NAME#v}" version >/dev/null 2>&1; then
             echo "already published"
