@@ -570,7 +570,14 @@ fn empty_name_queries_point_to_code_search() {
             text.starts_with("no results;") && text.contains("lantern code \"technician_id\""),
             "{command}: {text}"
         );
+        let hint = &f.ok(&[command, "technician_id"])["hint"];
+        assert!(
+            hint.as_str()
+                .is_some_and(|hint| hint.contains("lantern code \"technician_id\"")),
+            "{command}: {hint}"
+        );
     }
+    assert!(f.ok(&["code", "absent_text"]).get("hint").is_none());
     assert_eq!(
         f.text(&["code", "absent_text"]),
         "no results
@@ -612,4 +619,74 @@ Needle
     let context = f.lantern(&["code", "needle", "-C", "3"]);
     assert_eq!(context.code, 2);
     assert!(context.stderr.contains("--context 3"), "{}", context.stderr);
+    assert_eq!(f.lantern(&["code", "needle", "--context", "500"]).code, 0);
+}
+
+#[test]
+fn empty_results_point_from_a_wrong_guess_to_what_exists() {
+    let f = Fixture::new();
+    f.write(
+        "lib/user.ts",
+        "export class UserStore {\n  load() { getStats(1); }\n}\n",
+    );
+    let literal = f.text(&["code", r"getStats\(1"]);
+    assert!(literal.contains("add --regex"), "{literal}");
+    assert!(
+        f.text(&["code", r"getStats\(1", "--regex"])
+            .contains("lib/user.ts")
+    );
+    let qualified = f.text(&["symbols", "Store.load"]);
+    assert!(
+        qualified.contains("defined in: UserStore") && qualified.contains("UserStore.load"),
+        "{qualified}"
+    );
+    let missing = f.lantern(&["outline", "src/user.ts"]);
+    assert_eq!(missing.code, 1);
+    assert!(
+        missing.stderr.contains("named user.ts: lib/user.ts"),
+        "{}",
+        missing.stderr
+    );
+}
+
+#[test]
+fn symbol_bodies_are_the_file_lines_from_the_doc_comment_and_page_whole() {
+    let f = Fixture::new();
+    let source = "/** Doc. */\nfunction stepOne() {\n  return 1;\n}\n\nfunction stepTwo() {\n  return 2;\n}\n";
+    f.write("a.ts", source);
+    let lines: Vec<&str> = source.lines().collect();
+    let found = &f.ok(&["symbols", "stepOne", "--body"])["results"][0];
+    assert_eq!(found["line"], 2);
+    assert_eq!(
+        found["body"],
+        serde_json::json!({"line": 1, "text": lines[0..4]})
+    );
+
+    let both = f.text(&["symbols", "step", "--body"]);
+    assert!(both.contains("1:/** Doc. */\n2:function stepOne"), "{both}");
+    assert!(both.contains("7:  return 2;"), "{both}");
+    let one_body = f.text(&["symbols", "stepOne", "--body"]).len();
+    let budget = (one_body + 60).to_string();
+    let paged = f.text(&["symbols", "step", "--body", "--max-bytes", &budget]);
+    assert_eq!(paged.matches("  return").count(), 1, "{paged}");
+    let cursor = paged
+        .split("-- more: --cursor ")
+        .nth(1)
+        .expect("a cursor")
+        .trim();
+    let rest = f.text(&[
+        "symbols",
+        "step",
+        "--body",
+        "--max-bytes",
+        &budget,
+        "--cursor",
+        cursor,
+    ]);
+    assert_eq!(
+        paged.matches("return 1;").count() + rest.matches("return 1;").count(),
+        1,
+        "{paged}{rest}"
+    );
+    assert!(rest.contains("  return"), "{rest}");
 }

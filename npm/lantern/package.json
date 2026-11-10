@@ -13,8 +13,10 @@
     "bin",
     "skills"
   ],
+  "scripts": {
+    "postinstall": "node bin/postinstall.js"
+  },
   "engines": {
     "node": ">=18"
-  },
-  "optionalDependencies": {}
+  }
 }

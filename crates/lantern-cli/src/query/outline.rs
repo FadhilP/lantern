@@ -37,22 +37,28 @@ pub(crate) fn run(
     let full = paths::resolve_lexically(base, file)
         .filter(|full| !full.is_empty())
         .ok_or_else(|| Error::usage(format!("{file} is outside the workspace")))?;
-    let language: Option<Option<String>> = opened
+    let stored: Option<(bool, Option<String>)> = opened
         .conn
         .query_row(
-            "SELECT b.language FROM files f JOIN blobs b ON b.id = f.blob_id WHERE f.path = ?1",
+            "SELECT f.blob_id IS NOT NULL, b.language
+             FROM files f LEFT JOIN blobs b ON b.id = f.blob_id WHERE f.path = ?1",
             [&full],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map(Some)
         .or_else(|error| match error {
             rusqlite::Error::QueryReturnedNoRows => Ok(None),
             other => Err(other),
         })?;
-    let Some(language) = language else {
-        return Err(Error::failure(format!(
-            "{full} is not in the index as a text file"
-        )));
+    let shown = paths::from_dir(&opened.scope, &full);
+    let language = match stored {
+        Some((true, language)) => language,
+        Some((false, _)) => {
+            return Err(Error::failure(format!(
+                "{shown} is binary or larger than --max-file-size, so it has no outline"
+            )));
+        }
+        None => return Err(not_indexed(opened, &full, &shown)?),
     };
     let mut statement = opened.conn.prepare(
         "SELECT n.name, s.kind, s.line, s.end_line, s.signature
@@ -77,6 +83,29 @@ pub(crate) fn run(
         language,
         symbols,
     })
+}
+
+/// The error for a path the index lacks, with indexed text files of the same name, since the
+/// caller often guessed the folder.
+fn not_indexed(opened: &Opened, full: &str, shown: &str) -> Result<Error> {
+    let name = full.rsplit('/').next().unwrap_or(full);
+    let mut statement = opened.conn.prepare(
+        "SELECT path FROM files WHERE blob_id IS NOT NULL
+           AND (path = ?1 OR substr(path, -length(?1) - 1) = '/' || ?1)
+         ORDER BY path LIMIT 5",
+    )?;
+    let same_name: Vec<String> = statement
+        .query_map([name], |row| row.get::<_, String>(0))?
+        .map(|path| path.map(|path| paths::from_dir(&opened.scope, &path)))
+        .collect::<rusqlite::Result<_>>()?;
+    let mut message = format!("{shown} is not in the index: it does not exist or is ignored");
+    if !same_name.is_empty() {
+        message.push_str(&format!(
+            ". Indexed files named {name}: {}",
+            same_name.join(", ")
+        ));
+    }
+    Ok(Error::failure(message))
 }
 
 /// Nests nodes sorted by start line (outer first) by line-range containment.

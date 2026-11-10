@@ -1,7 +1,5 @@
 # Architecture
 
-This is an overview. The full design record, with every rule and its reason, is in [implementation-plan.md](implementation-plan.md).
-
 ## Layout
 
 ```text
@@ -17,7 +15,7 @@ crates/lantern-cli    the `lantern` binary
   src/query/          symbols, code, refs, graph, outline, pages
   queries/<lang>/     tree-sitter tag queries
   tests/cli/          integration tests that run the binary
-npm/                  npm launcher and platform package staging
+npm/                  npm package: launcher and install script
 skills/lantern/       agent skill shipped with the npm package
 ```
 
@@ -62,7 +60,7 @@ The generation of a shard goes up only when results change. Cursors carry the ge
 
 Each query opens the shard read-only in one read transaction. Every statement of a query therefore sees one commit, even while another process refreshes.
 
-- `symbols`: candidates from the trigram name index, a case-insensitive prefix range, and an initials range; ranked in Rust by match tier (exact, prefix, initials, substring), then word start, then name length.
+- `symbols`: candidates from the trigram name index, a case-insensitive prefix range, and an initials range; ranked in Rust by match tier (exact, prefix, initials, substring), then word start, then name length. With `--body`, each file on the page is parsed again, because the shard stores a definition's name line but not the line where its decorators and doc comments start.
 - `code`: literals extracted from the pattern give an FTS candidate query; candidates are decompressed and matched line by line in parallel.
 - `refs`: an exact name lookup with the enclosing definition.
 - `graph`: a breadth-first expansion over calls, resolved by name.

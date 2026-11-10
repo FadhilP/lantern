@@ -162,6 +162,9 @@ pub(crate) struct Symbol {
     pub line: u32,
     pub col: u32,
     pub end_line: u32,
+    /// The first line with the decorators, attributes, and doc comments of the definition; not
+    /// stored, only `symbols --body` reads it.
+    pub start_line: u32,
     pub signature: String,
 }
 
@@ -377,6 +380,7 @@ struct RawDefinition {
     line: u32,
     col: u32,
     end_line: u32,
+    start_line: u32,
 }
 
 #[derive(Debug)]
@@ -437,6 +441,7 @@ impl Tags {
                     line,
                     col,
                     end_line: end_line(node),
+                    start_line: lead_start_line(node).min(line),
                 });
             }
             Role::Reference(kind) => self.references.push(RawReference {
@@ -521,6 +526,7 @@ impl Tags {
                 line: definition.line,
                 col: definition.col,
                 end_line: definition.end_line.max(definition.line),
+                start_line: definition.start_line,
                 signature: signature(source, definition.name.start),
             });
             open.push(symbols.len() - 1);
@@ -580,6 +586,36 @@ fn definition_node(node: Node<'_>) -> Node<'_> {
         current = parent;
     }
     node
+}
+
+/// The first line of a definition with what belongs to it: a wrapping Python decorator or JS
+/// `export`, then the decorators, attributes, annotations, and comments right before it. A blank
+/// line, or code that ends on the comment's line, ends the lead.
+fn lead_start_line(node: Node<'_>) -> u32 {
+    let mut first = node;
+    while let Some(parent) = first
+        .parent()
+        .filter(|parent| matches!(parent.kind(), "decorated_definition" | "export_statement"))
+    {
+        first = parent;
+    }
+    while let Some(previous) = first.prev_named_sibling() {
+        let adjacent = previous.end_position().row + 1 >= first.start_position().row;
+        let trails_code = previous.prev_sibling().is_some_and(|before| {
+            !is_lead(before.kind()) && before.end_position().row == previous.start_position().row
+        });
+        if !adjacent || trails_code || !is_lead(previous.kind()) {
+            break;
+        }
+        first = previous;
+    }
+    first.start_position().row as u32 + 1
+}
+
+fn is_lead(kind: &str) -> bool {
+    ["comment", "attribute", "decorator", "annotation"]
+        .iter()
+        .any(|lead| kind.contains(lead))
 }
 
 fn refine(kind: SymbolKind, node: Node<'_>) -> SymbolKind {
@@ -1004,6 +1040,44 @@ function App() {
                 "{language}"
             );
         }
+    }
+
+    #[test]
+    fn a_definition_starts_at_its_decorators_attributes_and_doc_comments() {
+        let start_of = |language: Language, source: &str, name: &str| {
+            extract(language, source)
+                .symbols
+                .into_iter()
+                .find(|symbol| symbol.name == name)
+                .map(|symbol| (symbol.start_line, symbol.line))
+        };
+        let java = "class A {\n  int x; // trailing\n  /** Doc. */\n  @Override\n  @GetMapping(\n      \"/x\")\n  public void run() {\n  }\n}\n";
+        assert_eq!(start_of(Language::Java, java, "run"), Some((3, 7)));
+        let rust = "use x;\n\n/// Doc.\n#[test] #[ignore]\nfn run() {\n}\n";
+        assert_eq!(start_of(Language::Rust, rust, "run"), Some((3, 5)));
+        let python = "# Not attached.\n\n@app.route(\"/x\")\ndef run():\n    pass\n";
+        assert_eq!(start_of(Language::Python, python, "run"), Some((3, 4)));
+        let typescript =
+            "/** Doc. */\n@Component({})\nexport class Run {\n  @Input()\n  name() {}\n}\n";
+        assert_eq!(
+            start_of(Language::TypeScript, typescript, "Run"),
+            Some((1, 3))
+        );
+        assert_eq!(
+            start_of(Language::TypeScript, typescript, "name"),
+            Some((4, 5))
+        );
+        let javascript = "/** Doc. */\nexport function run() {}\n";
+        assert_eq!(
+            start_of(Language::JavaScript, javascript, "run"),
+            Some((1, 2))
+        );
+        let go = "package p\n\n// Run runs.\nfunc Run() {}\n";
+        assert_eq!(start_of(Language::Go, go, "Run"), Some((3, 4)));
+        let csharp = "class A {\n  /// Doc.\n  [HttpGet]\n  void Run() {}\n}\n";
+        assert_eq!(start_of(Language::CSharp, csharp, "Run"), Some((2, 4)));
+        let dart = "class A {\n  @override\n  void run() {}\n}\n";
+        assert_eq!(start_of(Language::Dart, dart, "run"), Some((2, 3)));
     }
 
     #[test]

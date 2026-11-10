@@ -84,11 +84,8 @@ pub(crate) fn run(
             "--per-file must be between 1 and {MAX_PER_FILE}"
         )));
     }
-    if query.context > MAX_CONTEXT {
-        return Err(Error::usage(format!(
-            "--context must be at most {MAX_CONTEXT}"
-        )));
-    }
+    // Clamped, not rejected: the docs promise "up to", and an error costs the caller a turn.
+    let context = query.context.min(MAX_CONTEXT);
     let filter = PathFilter::new(&query.path, &opened.scope)?;
     let languages = language_names(query.language.as_deref())?;
     let source = if query.regex {
@@ -175,7 +172,7 @@ pub(crate) fn run(
                 let text = shard::decompress(&compressed)?;
                 Ok((
                     blob_id,
-                    search(&text, &matcher, query.per_file, query.context).map(Arc::new),
+                    search(&text, &matcher, query.per_file, context).map(Arc::new),
                 ))
             })
             .collect::<Result<_>>()?;
@@ -195,6 +192,13 @@ pub(crate) fn run(
     }
     hits.truncate(needed);
     opened.page(&description, request, hits)
+}
+
+/// True when a literal pattern reads as a regex, such as `a|b`, `retry\(`, or `foo.*bar`, and
+/// would compile as one. `a || b`, `cmd | grep`, and `\n` do not count.
+pub(crate) fn looks_like_regex(pattern: &str) -> bool {
+    let syntax = Regex::new(r"\\[dwsbDWSB(){}\[\].|*+?^$]|\.[*+]|[^\s|]\|[^\s|]");
+    syntax.is_ok_and(|syntax| syntax.is_match(pattern)) && Regex::new(pattern).is_ok()
 }
 
 /// Line-oriented matching, like `rg`: a match never spans lines.
@@ -329,7 +333,17 @@ impl Need {
 
 #[cfg(test)]
 mod tests {
-    use super::fts_query;
+    use super::{fts_query, looks_like_regex};
+
+    #[test]
+    fn regex_syntax_in_a_literal_is_told_from_code_punctuation() {
+        for pattern in [r"a|b", r"getStats\(", r"Colors\.", "foo.*bar", r"\bword"] {
+            assert!(looks_like_regex(pattern), "{pattern}");
+        }
+        for pattern in ["retry(", "row.id", "a || b", "cmd | grep", r"\n", "a|b("] {
+            assert!(!looks_like_regex(pattern), "{pattern}");
+        }
+    }
 
     #[test]
     fn literals_become_trigram_filters() {

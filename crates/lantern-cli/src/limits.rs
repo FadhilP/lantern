@@ -9,7 +9,8 @@ pub const DEFAULT_CODE_LIMIT: usize = 10;
 pub const MAX_LIMIT: usize = 10_000;
 pub const DEFAULT_PER_FILE: usize = 20;
 pub const MAX_PER_FILE: usize = 1_000;
-pub const MAX_CONTEXT: usize = 20;
+pub const MAX_CONTEXT: usize = 50;
+pub const DEFAULT_BODY_LIMIT: usize = 5;
 pub const DEFAULT_GRAPH_DEPTH: usize = 1;
 pub const MAX_GRAPH_DEPTH: usize = 3;
 pub const DEFAULT_GRAPH_NODES: usize = 200;
@@ -19,6 +20,8 @@ pub const MAX_QUERY_CHARS: usize = 4_000;
 /// Longest line text, in characters, that any output carries.
 pub(crate) const MAX_LINE_CHARS: usize = 500;
 pub(crate) const MAX_SIGNATURE_CHARS: usize = 300;
+/// Longest body, in lines, that `symbols --body` prints per definition.
+pub(crate) const MAX_BODY_LINES: u32 = 100;
 /// A NUL byte in this prefix marks a file as binary.
 pub(crate) const TEXT_SNIFF_BYTES: usize = 8 * 1024;
 pub(crate) const MAX_RULE_FILE_BYTES: u64 = 4 << 20;

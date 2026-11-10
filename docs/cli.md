@@ -6,7 +6,7 @@ lantern [GLOBAL OPTIONS] <COMMAND>
 lantern index   [PATH] [--rebuild]
 lantern status  [PATH]
 lantern prune
-lantern symbols <query>   [--kind K] [--language L] [--path GLOB]... [--include-generated]
+lantern symbols <query>   [--kind K] [--language L] [--path GLOB]... [--include-generated] [--body]
 lantern code    <pattern> | -e <pattern> [--regex] [--case-sensitive] [--path GLOB]... [--language L]
                           [--per-file N] [--context N] [--sort relevance|path] [--include-generated]
 lantern refs    <name>    [--kind call|type|import|implementation] [--path GLOB]... [--include-generated]
@@ -80,10 +80,11 @@ Deletes the shards of roots that no longer exist, and stray files in the data di
 Search over definitions by exact name, prefix, initials, or substring; a query whose letters are not adjacent in the name does not match. Ranking: exact name, case-insensitive exact name, prefix, initials (`gubi` finds `getUserById` and `get_user_by_id`), then substring (3 characters or more), with a match at the start of a word before a match inside a word. Ties go to the shorter name, the more important kind, non-test files, and shorter paths.
 
 - `Container.name` or `Container::name` narrows to definitions inside that container (case-insensitive).
+- `--body` adds the source lines of each definition, up to 100 lines, to `end_line`. A body starts at the first decorator, attribute, annotation, or doc comment right before the definition (a blank line ends them), so it can start before the row's `line`. Each file on the page is parsed again to find that start; if the parse runs out of time, the body starts at `line`. The default limit drops to 5.
 - `--kind`: `function`, `method`, `class`, `interface`, `struct`, `enum`, `trait`, `type`, `module`, `constant`, `variable`, `field`.
 - `--language`: `c`, `cpp`, `csharp`, `dart`, `go`, `java`, `javascript` (includes `.jsx` files), `php`, `python`, `ruby`, `rust`, `typescript` (also selects `tsx`), `tsx`.
 
-Row: `name, kind, container, path, line, end_line, signature`. Default limit 30.
+Row: `name, kind, container, path, line, end_line, signature, body?`. `body` is `{line, text}`: the first line number and the source lines. Default limit 30.
 
 ### `code <pattern>`
 
@@ -93,14 +94,14 @@ Line search. The pattern is a literal unless `--regex` is set (Rust `regex` synt
 - `-i` is accepted and changes nothing, since matching already ignores case.
 
 - `--per-file N` caps the matches per file (default 20, max 1000). `match_count` still counts every match.
-- `--context N` adds up to 20 lines as `before` and `after` on each match.
+- `--context N` adds up to N lines as `before` and `after` on each match. A value over 50 counts as 50.
 - `--sort relevance` (default) ranks files by FTS score with generated files last. `--sort path` orders by path.
 
 Row (one per file): `path, match_count, matches: [{line, column, text, before?, after?}]`. `column` is a 1-based byte column. Line text is capped at 500 characters. Default limit 10 files.
 
 ### `refs <name>`
 
-References to an exact, case-sensitive name. `--kind call|type|import|implementation` filters them.
+References to an exact, case-sensitive name. `--kind call|type|import|implementation` filters them. Every language records `call` references. `type` references exist only for Dart, Go, and TypeScript/TSX; `import` references only for Dart and JavaScript/TypeScript/TSX; `implementation` references for Dart, Java, JavaScript/TypeScript/TSX, PHP, and Rust. In other languages, find type uses and imports with `lantern code`.
 
 Row: `path, line, column, kind, text, enclosing`. `enclosing` is `{name, container, kind}` of the innermost definition around the reference; it is left out at the top level. The page has `"resolution": "name"`.
 
@@ -140,6 +141,7 @@ List results look like this:
 - `--limit N` sets the page size (1–10000).
 - Null fields are left out, and so are `truncated` and `next_cursor` on the last page.
 - When `truncated` is true, pass `next_cursor` back with `--cursor` and the same query to get the next page.
+- An empty page carries `hint` when the text output would show one: a better command to try, or why nothing matched.
 - A cursor belongs to one query. Using it with another query is a usage error (exit 2). If the index changed since the cursor was made, the command fails with exit 4; run the query again without `--cursor`.
 - `--max-bytes N` removes rows from the end of the page until the output fits, and points `next_cursor` at the first removed row, so no row is lost. If not even one row fits, the command exits 2.
 
@@ -164,12 +166,12 @@ Errors go to stderr as `{"error":{"code":"...","message":"..."}}`, with the mess
 
 Without `--json`, list commands and `graph` print compact text for agents and people. Scripts should use `--json`; the text format can change.
 
-- `symbols`: `path:line-end_line kind[ in Container]: signature`, one per line.
+- `symbols`: `path:line-end_line kind[ in Container]: signature`, one per line. With `--body`, `line:text` lines follow, then `-- body cut: N more lines` when the body is longer than 100 lines.
 - `code`: a heading line with the file path (`path (N matches, M shown)` when `--per-file` cut matches), then `line:text` for each match and `line-text` for `--context` lines.
 - `refs`: a heading line with the file path, then `line kind[ in Container.name]: text` for each reference.
 - `outline`: `line-end_line kind name`, indented two spaces per nesting level.
 - `graph`: one line per node, `id kind Container.name path:line`, with roots marked `(root)`. Then one line per edge, `from -> to kind at line N`, where line N is in the file of the `from` node. Then `unresolved: ...`.
-- `no results` means nothing matched. For `symbols`, `refs`, and `graph`, a hint follows with the `lantern code` command that finds the name as text, since fields, keys, and strings are not recorded as definitions or references. For `outline`, a hint follows when no parser covers the file type (CSS, HTML), so a file with no symbols stays apart from a file Lantern cannot outline.
+- `no results` means nothing matched. With `--json`, an empty page or graph carries the same hint in a `hint` field. For `symbols`, `refs`, and `graph`, a hint follows with the `lantern code` command that finds the name as text, since fields, keys, and strings are not recorded as definitions or references. For `symbols Container.name` when other containers define the name, the hint lists them instead. For a literal `code` pattern with regex syntax (`a|b`, `getStats\(`), the hint says to add `--regex`. For `outline`, a hint follows when no parser covers the file type (CSS, HTML), so a file with no symbols stays apart from a file Lantern cannot outline.
 - A last line `-- more: --cursor <value>` means more rows exist. `-- truncated` on a graph means `--max-nodes` or `--max-bytes` cut it.
 
-`index`, `status`, and `prune` print their report as indented JSON. Errors print as `lantern: <message>`. `-C` takes a directory; `-C 3` with no directory `3` is a usage error that points to `--context 3`.
+`index`, `status`, and `prune` print their report as indented JSON. Errors print as `lantern: <message>`. When `outline` gets a path that is not in the index, the error lists up to 5 indexed files with the same file name. `-C` takes a directory; `-C 3` with no directory `3` is a usage error that points to `--context 3`.

@@ -12,6 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # npm is the directory in npm/lantern/bin that bin/binary.js looks for.
         include:
           - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04, npm: linux-x64-gnu }
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, npm: linux-arm64-gnu }
@@ -34,26 +35,34 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo test --release --locked --target ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }} -p lantern-cli
-      - name: Stage npm package and archive
+      - name: Stage binary and archive
         shell: bash
         run: |
           exe=lantern; [[ "${{ matrix.target }}" == *windows* ]] && exe=lantern.exe
-          node npm/stage-platform.mjs "${{ matrix.npm }}" "target/${{ matrix.target }}/release/$exe" "${GITHUB_REF_NAME#v}"
+          mkdir -p "npm/lantern/bin/${{ matrix.npm }}"
+          cp "target/${{ matrix.target }}/release/$exe" "npm/lantern/bin/${{ matrix.npm }}/"
           tar -czf "lantern-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" "$exe"
-      - name: Smoke test through the npm launcher
+      - name: Smoke test through npm
         shell: bash
         run: |
           mkdir -p smoke
           # Tarballs install as copies, like the registry; directory installs are symlinks.
-          (cd npm/dist/${{ matrix.npm }} && npm pack --pack-destination ../../../smoke)
           (cd npm/lantern && npm pack --pack-destination ../../smoke)
           cd smoke && npm init -y >/dev/null && npm install ./*.tgz --no-save
           npx lantern status --json
+          # A global install must point the command at the binary, not at Node.
+          npm install -g --prefix "$PWD/global" ./*.tgz
+          PATH="$PWD/global:$PWD/global/bin:$PATH" lantern --version
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            grep -q 'lantern\.exe' global/lantern.cmd
+          else
+            [[ "$(readlink global/bin/lantern)" == */lantern ]]
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.npm }}
           path: |
-            npm/dist/${{ matrix.npm }}
+            npm/lantern/bin/${{ matrix.npm }}
             lantern-${{ matrix.target }}.tar.gz
 
   publish:
@@ -84,13 +93,15 @@ jobs:
           fi
       # Trusted publishing (OIDC): no token. Already published versions are skipped, so a rerun can finish a partial release.
       - name: npm publish
+        working-directory: npm/lantern
         run: |
-          publish() {
-            spec="$(node -p "const p=require('./$1/package.json'); p.name+'@'+p.version")"
-            if npm view "$spec" version >/dev/null 2>&1; then echo "skip $spec"; else npm publish "$1" --access public; fi
-          }
+          cp -r ../../artifacts/*/npm/lantern/bin/* bin/
           # Artifacts lose the executable bit, and npm only restores it for `bin` entries.
-          find artifacts -path '*/bin/lantern' -exec chmod +x {} +
-          for dir in artifacts/*/npm/dist/*; do publish "$dir"; done
-          node npm/stage-platform.mjs --main "${GITHUB_REF_NAME#v}"
-          publish npm/lantern
+          chmod +x bin/*/lantern
+          cp -r ../../skills .
+          npm pkg set version="${GITHUB_REF_NAME#v}"
+          if npm view "@fadhilp/lantern@${GITHUB_REF_NAME#v}" version >/dev/null 2>&1; then
+            echo "already published"
+          else
+            npm publish --access public
+          fi

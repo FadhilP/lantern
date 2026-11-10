@@ -14,7 +14,7 @@ use crate::query::code::{CodeHit, CodeQuery};
 use crate::query::graph::{Graph, GraphQuery};
 use crate::query::outline::Outline;
 use crate::query::refs::{RefHit, RefsQuery};
-use crate::query::symbols::{SymbolHit, SymbolQuery};
+use crate::query::symbols::{SymbolQuery, SymbolsFound};
 use crate::query::{self, Freshness, Opened, Page, PageRequest};
 use crate::refresh::{self, Mode, RefreshCounts, Settings};
 use crate::source::SourceKind;
@@ -209,12 +209,12 @@ impl Lantern {
         query: &SymbolQuery,
         freshness: Freshness,
         page: &PageRequest,
-    ) -> Result<Page<SymbolHit>> {
+    ) -> Result<SymbolsFound> {
         let (opened, resolved) = self.open_root(cwd, freshness)?;
         let mut found = query::symbols::run(&opened, query, page)?;
         rebase(
             &resolved.scope,
-            found.rows.iter_mut().map(|hit| &mut hit.path),
+            found.page.rows.iter_mut().map(|hit| &mut hit.path),
         );
         Ok(found)
     }

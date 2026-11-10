@@ -80,6 +80,9 @@ impl Printer {
                 document["truncated"] = json!(true);
                 document["next_cursor"] = json!(cursor);
             }
+            if page.rows.is_empty() {
+                document["hint"] = json!(hint(empty));
+            }
             for (key, value) in extra {
                 document[*key] = value.clone();
             }
@@ -103,6 +106,9 @@ impl Printer {
             }
             let mut document = to_value(&kept);
             document["schema"] = json!(SCHEMA);
+            if graph.nodes.is_empty() {
+                document["hint"] = json!(hint(empty));
+            }
             drop_nulls(&mut document);
             document.to_string()
         };
@@ -167,19 +173,30 @@ fn fit(
     Ok(render(low))
 }
 
+/// One line per definition; with `--body`, its `line:text` source lines follow.
 pub fn symbol_lines(hits: &[SymbolHit]) -> Vec<String> {
-    hits.iter()
-        .map(|hit| {
-            format!(
-                "{}:{}-{} {}: {}",
-                hit.path,
-                hit.line,
-                hit.end_line,
-                kind_in(hit.kind, hit.container.as_deref()),
-                hit.signature
-            )
-        })
-        .collect()
+    let mut lines = Vec::new();
+    for hit in hits {
+        lines.push(format!(
+            "{}:{}-{} {}: {}",
+            hit.path,
+            hit.line,
+            hit.end_line,
+            kind_in(hit.kind, hit.container.as_deref()),
+            hit.signature
+        ));
+        let Some(body) = &hit.body else {
+            continue;
+        };
+        for (line, text) in (body.line..).zip(&body.text) {
+            lines.push(format!("{line}:{text}"));
+        }
+        let cut = (hit.end_line + 1 - body.line) as usize - body.text.len();
+        if cut > 0 {
+            lines.push(format!("-- body cut: {cut} more lines"));
+        }
+    }
+    lines
 }
 
 /// One heading per file, then rg-style `line:text` matches and `line-text` context.
@@ -302,6 +319,11 @@ fn qualified(container: Option<&str>, name: &str) -> String {
         Some(container) => format!("{container}.{name}"),
         None => name.to_owned(),
     }
+}
+
+/// The hint of an `empty` text, for JSON; `None` for a bare `no results`.
+fn hint(empty: &str) -> Option<&str> {
+    empty.strip_prefix("no results;").map(str::trim)
 }
 
 /// `empty` is the text for no lines: `no results`, or that with a hint toward a better command.

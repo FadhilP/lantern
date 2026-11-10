@@ -26,13 +26,14 @@ use crate::engine::{Lantern, Options};
 use crate::error::{Error, ErrorKind};
 use crate::extract::{RefKind, SymbolKind};
 use crate::limits::{
-    DEFAULT_CODE_LIMIT, DEFAULT_GRAPH_DEPTH, DEFAULT_GRAPH_NODES, DEFAULT_LIMIT, DEFAULT_PER_FILE,
+    DEFAULT_BODY_LIMIT, DEFAULT_CODE_LIMIT, DEFAULT_GRAPH_DEPTH, DEFAULT_GRAPH_NODES,
+    DEFAULT_LIMIT, DEFAULT_PER_FILE,
 };
 use crate::output::Printer;
-use crate::query::code::{CodeQuery, CodeSort};
+use crate::query::code::{CodeQuery, CodeSort, looks_like_regex};
 use crate::query::graph::{Direction, GraphQuery};
 use crate::query::refs::RefsQuery;
-use crate::query::symbols::SymbolQuery;
+use crate::query::symbols::{SymbolQuery, split_qualified};
 use crate::query::{Freshness, PageRequest};
 use crate::refresh::Mode;
 
@@ -93,6 +94,9 @@ enum Command {
         path: Vec<String>,
         #[arg(long)]
         include_generated: bool,
+        /// Print the source lines of each definition; the default --limit drops to 5.
+        #[arg(long)]
+        body: bool,
         #[command(flatten)]
         page: PageArgs,
     },
@@ -268,6 +272,7 @@ fn run(cli: Cli, printer: &Printer) -> Result<(), Error> {
             language,
             path,
             include_generated,
+            body,
             page,
         } => {
             let query = SymbolQuery {
@@ -276,19 +281,40 @@ fn run(cli: Cli, printer: &Printer) -> Result<(), Error> {
                 language,
                 path,
                 include_generated,
+                body,
+            };
+            let default_limit = if body {
+                DEFAULT_BODY_LIMIT
+            } else {
+                DEFAULT_LIMIT
             };
             let found = lantern.symbols(
                 &cwd,
                 &query,
                 freshness(page.stale_ok),
-                &page.request(DEFAULT_LIMIT),
+                &page.request(default_limit),
             )?;
-            let note = unparsed_note(found.unparsed_files);
-            let empty = format!(
-                "no results; for a field, a key, or text, try: lantern code \"{}\"{note}",
-                query.query
-            );
-            printer.page(&found, page.max_bytes, &[], &empty, output::symbol_lines)?;
+            let note = unparsed_note(found.page.unparsed_files);
+            let empty = match (
+                found.other_containers.first(),
+                split_qualified(&query.query),
+            ) {
+                (Some(first), (Some(container), name)) => format!(
+                    "no results; \"{name}\" is not defined in {container}. It is defined in: {}. Try: lantern symbols {first}.{name}{note}",
+                    found.other_containers.join(", ")
+                ),
+                _ => format!(
+                    "no results; for a field, a key, or text, try: lantern code \"{}\"{note}",
+                    query.query
+                ),
+            };
+            printer.page(
+                &found.page,
+                page.max_bytes,
+                &[],
+                &empty,
+                output::symbol_lines,
+            )?;
         }
         Command::Code {
             pattern,
@@ -324,13 +350,12 @@ fn run(cli: Cli, printer: &Printer) -> Result<(), Error> {
                 freshness(page.stale_ok),
                 &page.request(DEFAULT_CODE_LIMIT),
             )?;
-            printer.page(
-                &found,
-                page.max_bytes,
-                &[],
-                "no results",
-                output::code_lines,
-            )?;
+            let empty = if !query.regex && looks_like_regex(&query.pattern) {
+                "no results; the pattern was matched as literal text and has regex syntax. For a regex, add --regex"
+            } else {
+                "no results"
+            };
+            printer.page(&found, page.max_bytes, &[], empty, output::code_lines)?;
         }
         Command::Refs {
             name,
