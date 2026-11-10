@@ -1,8 +1,8 @@
 name: release
 
 on:
-  push:
-    tags: ["v*"]
+  release:
+    types: [published]
 
 permissions:
   contents: read
@@ -82,16 +82,10 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
-      - name: GitHub release
+      - name: Attach archives to the release
         env:
           GH_TOKEN: ${{ github.token }}
-        # A rerun after a partial release uploads the archives that are missing.
-        run: |
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" artifacts/*/lantern-*.tar.gz --clobber
-          else
-            gh release create "$GITHUB_REF_NAME" artifacts/*/lantern-*.tar.gz --generate-notes
-          fi
+        run: gh release upload "$GITHUB_REF_NAME" artifacts/*/lantern-*.tar.gz --clobber
       # Trusted publishing (OIDC): no token. Already published versions are skipped, so a rerun can finish a partial release.
       - name: npm publish
         working-directory: npm/lantern
