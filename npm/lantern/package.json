@@ -5,7 +5,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/fadhilp/lantern.git"
+    "url": "git+https://github.com/FadhilP/lantern.git"
   },
   "bin": {
     "lantern": "bin/lantern.js"

@@ -7,7 +7,7 @@ version = "0.4.0"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT"
-repository = "https://github.com/fadhilp/lantern"
+repository = "https://github.com/FadhilP/lantern"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

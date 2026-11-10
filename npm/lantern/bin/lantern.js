@@ -8,7 +8,7 @@ const binary = findBinary();
 if (!binary) {
   console.error(
     `lantern: no prebuilt binary for ${process.platform}-${process.arch}; ` +
-      "install from source with `cargo install --git https://github.com/fadhilp/lantern lantern-cli`",
+      "install from source with `cargo install --git https://github.com/FadhilP/lantern lantern-cli`",
   );
   process.exit(1);
 }

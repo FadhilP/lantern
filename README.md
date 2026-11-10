@@ -29,7 +29,7 @@ The npm package ships prebuilt binaries for Linux (x64, arm64; glibc and musl), 
 From source (Rust 1.90 or later):
 
 ```sh
-cargo install --locked --git https://github.com/fadhilp/lantern lantern-cli
+cargo install --locked --git https://github.com/FadhilP/lantern lantern-cli
 ```
 
 ## Quick start
