@@ -274,20 +274,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
-name = "dashmap"
-version = "6.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6361d5c062261c78a176addb82d4c821ae42bed6089de0e12603cd25de2059c"
-dependencies = [
- "cfg-if",
- "crossbeam-utils",
- "hashbrown 0.14.5",
- "lock_api",
- "once_cell",
- "parking_lot_core",
-]
-
-[[package]]
 name = "defmt"
 version = "0.3.101"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -445,16 +431,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b92b20c1560511a9014b16e29db2f3c6f0580d4fe289b70f41131277b065a3b0"
 dependencies = [
  "gix-actor",
- "gix-attributes",
- "gix-command",
  "gix-commitgraph",
  "gix-config",
  "gix-date",
  "gix-diff",
- "gix-dir",
  "gix-discover",
  "gix-error",
- "gix-filter",
  "gix-fs",
  "gix-glob",
  "gix-hash",
@@ -468,7 +450,6 @@ dependencies = [
  "gix-pack",
  "gix-parallel",
  "gix-path",
- "gix-pathspec",
  "gix-protocol",
  "gix-quote",
  "gix-ref",
@@ -477,7 +458,6 @@ dependencies = [
  "gix-revwalk",
  "gix-sec",
  "gix-shallow",
- "gix-submodule",
  "gix-tempfile",
  "gix-trace",
  "gix-traverse",
@@ -620,26 +600,6 @@ dependencies = [
  "gix-error",
  "gix-hash",
  "gix-object",
-]
-
-[[package]]
-name = "gix-dir"
-version = "0.32.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af939f21c65d4f15457c72d08c874d454893185c51a3596e3c2bd3d9c567618d"
-dependencies = [
- "bstr",
- "gix-discover",
- "gix-error",
- "gix-fs",
- "gix-ignore",
- "gix-index",
- "gix-object",
- "gix-path",
- "gix-pathspec",
- "gix-trace",
- "gix-utils",
- "gix-worktree",
 ]
 
 [[package]]
@@ -823,13 +783,10 @@ checksum = "beaf9086dd00b9d2a177ca3ae83210ce926cee7c0faa112e053851221cd8f94d"
 dependencies = [
  "bstr",
  "gix-actor",
- "gix-command",
  "gix-date",
  "gix-error",
  "gix-hash",
  "gix-hashtable",
- "gix-path",
- "gix-tempfile",
  "gix-utils",
  "gix-validate",
  "itoa",
@@ -917,21 +874,6 @@ dependencies = [
  "gix-error",
  "gix-trace",
  "gix-validate",
-]
-
-[[package]]
-name = "gix-pathspec"
-version = "0.22.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "490aa03a11e0cbb998a0a593b75e27ea2e30df4ebd8f84f60e0641b9b72270e8"
-dependencies = [
- "bitflags 2.13.2",
- "bstr",
- "gix-attributes",
- "gix-config-value",
- "gix-error",
- "gix-glob",
- "gix-path",
 ]
 
 [[package]]
@@ -1053,27 +995,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "gix-submodule"
-version = "0.36.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d558a1307b6f3de2a92bd91d0570c53952d4f2329e6860813007508c8ed413dc"
-dependencies = [
- "bstr",
- "gix-config",
- "gix-error",
- "gix-path",
- "gix-pathspec",
- "gix-refspec",
- "gix-url",
-]
-
-[[package]]
 name = "gix-tempfile"
 version = "26.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8fdb135a043d6106b59bc58d59a326b277e495ec26fb9e02a1e2b6354bf4b5a"
 dependencies = [
- "dashmap",
  "gix-fs",
  "libc",
  "parking_lot",
@@ -1167,7 +1093,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fe92aec0a25cf073394492a6ee2aa4d27632acde91a653d34de0e4da6afb485d"
 dependencies = [
  "bstr",
- "gix-attributes",
  "gix-error",
  "gix-fs",
  "gix-glob",
@@ -1176,7 +1101,6 @@ dependencies = [
  "gix-index",
  "gix-object",
  "gix-path",
- "gix-validate",
 ]
 
 [[package]]
@@ -1230,12 +1154,6 @@ checksum = "47d60b12902ba28e2730cd37e95b8c9223af2808df9e902d4df49588d1470606"
 dependencies = [
  "byteorder",
 ]
-
-[[package]]
-name = "hashbrown"
-version = "0.14.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 
 [[package]]
 name = "hashbrown"
@@ -1388,7 +1306,7 @@ dependencies = [
 
 [[package]]
 name = "lantern-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "blake3",
  "clap",

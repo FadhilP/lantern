@@ -6,7 +6,8 @@ use crate::common::{Fixture, count, files_with, names, paths, strings};
 fn inventory_equals_git_ls_files() {
     let f = Fixture::new();
     f.git("", &["init", "-q"]);
-    f.write(".gitignore", "ignored/\n*.log\n");
+    f.write(".gitignore", "ignored/\n*.log\nlogs/*\n!logs/keep.ts\n");
+    f.write("sub/.gitignore", "*.tmp\n");
     f.write(".git/info/exclude", "excluded.txt\n");
     for path in [
         "src/a.ts",
@@ -14,6 +15,11 @@ fn inventory_equals_git_ls_files() {
         "dist/bundle.js",
         "tracked.log",
         "ignored/x.ts",
+        "ignored/forced.ts",
+        "logs/keep.ts",
+        "logs/drop.ts",
+        "sub/a.tmp",
+        "sub/b.ts",
         "excluded.txt",
         "untracked.md",
         "deleted.ts",
@@ -21,7 +27,7 @@ fn inventory_equals_git_ls_files() {
         f.write(path, "MARK\n");
     }
     f.git("", &["add", ".gitignore", "src/a.ts", "deleted.ts"]);
-    f.git("", &["add", "-f", "tracked.log"]);
+    f.git("", &["add", "-f", "tracked.log", "ignored/forced.ts"]);
     f.git("", &["commit", "-qm", "init"]);
     f.remove("deleted.ts");
     f.write("nested/inner.ts", "MARK\n");
@@ -37,7 +43,14 @@ fn inventory_equals_git_ls_files() {
         .map(str::to_owned)
         .collect();
     expected.sort();
-    assert!(expected.contains(&"tracked.log".to_owned()), "{expected:?}");
+    for kept in [
+        "tracked.log",
+        "ignored/forced.ts",
+        "logs/keep.ts",
+        "sub/b.ts",
+    ] {
+        assert!(expected.contains(&kept.to_owned()), "{expected:?}");
+    }
     assert_eq!(files_with(&f, &f.root, "MARK"), expected);
 }
 

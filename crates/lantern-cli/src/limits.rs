@@ -28,6 +28,8 @@ pub(crate) const MAX_RULE_FILE_BYTES: u64 = 4 << 20;
 pub(crate) const MAX_RULE_TOTAL_BYTES: u64 = 64 << 20;
 pub(crate) const MAX_DEPTH: usize = 1_024;
 pub(crate) const REFRESH_ATTEMPTS: u32 = 3;
+/// Threads that stat the inventory's files.
+pub(crate) const STAT_THREADS: usize = 4;
 /// Covers coarse file timestamps (2 s on FAT) when a file time is compared with the scan time.
 pub(crate) const RACY_SLACK_MS: i64 = 2_000;
 /// Parses of one blob that may time out before Lantern stops retrying it.

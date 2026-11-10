@@ -1,20 +1,19 @@
 //! The Git source: index entries plus untracked files that Git's standard excludes keep, for the
 //! root repository and every checked-out submodule below it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
 
-use gix::dir::EntryRef;
-use gix::dir::entry::{Kind, Status};
-use gix::dir::walk::{Action, Delegate, EmissionMode};
 use gix::index::entry::Mode;
+use gix::worktree::stack::state::ignore::Source;
 use rayon::prelude::*;
 
 use super::{DirRules, GITATTRIBUTES, Inventory, LANTERNIGNORE, Scan, classify, read_rule_file};
 use crate::error::{Error, Result};
-use crate::fsmeta::{self, EntryKind, Stat};
+use crate::fsmeta::{self, EntryKind, Listed, Stat};
 use crate::limits;
 use crate::paths;
 use crate::rules::{Exclusions, ScopedRules};
@@ -51,7 +50,7 @@ pub(super) fn inventory(scan: &Scan<'_>) -> Result<Inventory> {
     let (head, branch) = head(&repo)?;
     let mut walk = Walk {
         scan,
-        paths: Vec::new(),
+        stats: Vec::new(),
         rules: DirRules::default(),
         rule_bytes: AtomicU64::new(0),
         nested: 0,
@@ -59,20 +58,19 @@ pub(super) fn inventory(scan: &Scan<'_>) -> Result<Inventory> {
     };
     let mut ancestors = vec![paths::root_key(scan.root)];
     walk.repository(&repo, scan.root, "", &mut ancestors)?;
-    let stats = stat_all(scan, walk.paths)?;
     Ok(Inventory {
-        files: classify(stats, &walk.rules)?,
+        files: classify(walk.stats, &walk.rules)?,
         rules_digest: walk.rules.digest(),
         head: Some(head),
         branch: Some(branch),
     })
 }
 
-/// The paths and rule files of the root repository and its nested repositories, relative to
-/// the root.
+/// The file stats and rule files of the root repository and its nested repositories, with
+/// paths relative to the root.
 struct Walk<'walk> {
     scan: &'walk Scan<'walk>,
-    paths: Vec<String>,
+    stats: Vec<(String, Stat)>,
     rules: DirRules,
     rule_bytes: AtomicU64,
     nested: usize,
@@ -103,20 +101,16 @@ impl Walk<'_> {
             }
         }
         self.scan.check_deadline()?;
-        let mut untracked = Untracked::default();
-        let options = repo
-            .dirwalk_options()
-            .map_err(|error| Error::failure(format!("Git walk options: {error}")))?
-            .emit_untracked(EmissionMode::Matching)
-            .emit_ignored(None)
-            .emit_tracked(false)
-            .emit_pruned(false)
-            .emit_empty_directories(false)
-            .recurse_repositories(false);
-        let interrupt = AtomicBool::new(false);
-        repo.dirwalk(&index, None::<&str>, &interrupt, options, &mut untracked)
-            .map_err(|error| Error::failure(format!("Git untracked walk failed: {error}")))?;
-        files.extend(untracked.0);
+        let mut stats = list_tree(self.scan, repo, &index, root, &files, &gitlinks)?;
+        // A tracked file that no listing shows, such as one below a directory link, is statted
+        // by path.
+        let missing = files
+            .iter()
+            .filter(|path| !stats.contains_key(*path))
+            .cloned()
+            .collect();
+        stats.extend(stat_files(self.scan, root, missing)?);
+        files.extend(stats.keys().cloned());
         self.scan.check_deadline()?;
 
         let data_dir = paths::relative(root, self.scan.data_dir);
@@ -138,7 +132,13 @@ impl Walk<'_> {
 
         let below = |path: &str| paths::join(prefix, path);
         let below_dir = |(dir, content): (String, String)| (below(&dir), content);
-        self.paths.extend(files.iter().map(|path| below(path)));
+        for path in &files {
+            match stats.remove(path) {
+                Some(Ok(stat)) => self.stats.push((below(path), stat)),
+                Some(Err(error)) => return Err(Error::io(&root.join(path), &error)),
+                None => {}
+            }
+        }
         self.rules
             .lanternignore
             .extend(rules.lanternignore.into_iter().map(below_dir));
@@ -225,35 +225,166 @@ fn read_rules(root: &Path, paths: &BTreeSet<String>, total: &AtomicU64) -> Resul
     Ok(rules)
 }
 
-fn stat_all(scan: &Scan<'_>, paths: Vec<String>) -> Result<Vec<(String, Stat)>> {
-    let stats: Vec<Option<(String, Stat)>> = paths
-        .into_par_iter()
-        .map(|path| {
-            scan.check_deadline()?;
-            let full: PathBuf = scan.root.join(&path);
-            match fsmeta::lstat(&full) {
-                Ok(stat) if stat.kind == EntryKind::File => Ok(Some((path, stat))),
-                Ok(_) => Ok(None),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-                Err(error) => Err(Error::io(&full, &error)),
+/// The stats of the tracked files and of the untracked files that Git's excludes keep, from one
+/// listing per directory. Errors wait in the map like in [`stat_files`]. Each level of
+/// directories is listed in parallel; ignore rules are matched on one thread, in path order,
+/// because gix's exclude stack is stateful.
+fn list_tree(
+    scan: &Scan<'_>,
+    repo: &gix::Repository,
+    index: &gix::worktree::Index,
+    root: &Path,
+    files: &BTreeSet<String>,
+    gitlinks: &[String],
+) -> Result<HashMap<String, io::Result<Stat>>> {
+    let options = repo
+        .filesystem_options()
+        .map_err(|error| Error::failure(format!("Git file system options: {error}")))?;
+    let ignore_case = options.ignore_case;
+    let fold = |path: &str| {
+        if ignore_case {
+            path.to_lowercase()
+        } else {
+            path.to_owned()
+        }
+    };
+    let tracked: HashMap<String, &String> = files.iter().map(|path| (fold(path), path)).collect();
+    let gitlinks: HashSet<String> = gitlinks.iter().map(|path| fold(path)).collect();
+    let mut tracked_dirs = HashSet::new();
+    for path in tracked.keys().chain(&gitlinks) {
+        let mut dir = path.as_str();
+        while let Some((parent, _)) = dir.rsplit_once('/') {
+            if !tracked_dirs.insert(parent.to_owned()) {
+                break;
             }
-        })
-        .collect::<Result<_>>()?;
+            dir = parent;
+        }
+    }
+    let mut excludes = repo
+        .excludes(index, None, Source::WorktreeThenIdMappingIfNotSkipped)
+        .map_err(|error| Error::failure(format!("Git excludes: {error}")))?;
+    let mut is_excluded = |path: &str, is_dir: bool| -> Result<bool> {
+        let mode = if is_dir { Mode::DIR } else { Mode::FILE };
+        excludes
+            .at_entry(path, Some(mode))
+            .map(|platform| platform.is_excluded())
+            .map_err(|error| Error::failure(format!("Git excludes at {path}: {error}")))
+    };
+    let is_dot_git =
+        |name: &str| name == ".git" || (ignore_case && name.eq_ignore_ascii_case(".git"));
+
+    let mut stats = HashMap::new();
+    let mut level = vec![Dir {
+        path: String::new(),
+        tracked: true,
+    }];
+    while !level.is_empty() {
+        scan.check_deadline()?;
+        let listings: Vec<io::Result<Vec<Listed>>> = in_stat_pool(|| {
+            level
+                .par_iter()
+                .map(|dir| fsmeta::list_dir(&root.join(&dir.path)))
+                .collect()
+        });
+        let mut next = Vec::new();
+        for (dir, listing) in level.iter().zip(listings) {
+            let full = root.join(&dir.path);
+            let entries = match listing {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(Error::io(&full, &error)),
+            };
+            // Git does not enter an untracked directory that is a repository of its own.
+            let holds_repository = || {
+                entries.iter().any(|(name, _)| is_dot_git(name))
+                    && gix::discover::is_git(&full.join(".git")).is_ok()
+            };
+            if !dir.tracked && holds_repository() {
+                continue;
+            }
+            for (name, stat) in entries {
+                // macOS can list a name decomposed; Git stores it precomposed (`core.precomposeUnicode`).
+                let name = if options.precompose_unicode {
+                    gix::utils::str::precompose(name.into()).into_owned()
+                } else {
+                    name
+                };
+                if is_dot_git(&name) {
+                    continue;
+                }
+                let path = paths::join(&dir.path, &name);
+                let folded = fold(&path);
+                match stat.as_ref().map_or(EntryKind::File, |stat| stat.kind) {
+                    EntryKind::File => {
+                        if let Some(&index_path) = tracked.get(&folded) {
+                            stats.insert(index_path.clone(), stat);
+                        } else if !is_excluded(&path, false)? {
+                            stats.insert(path, stat);
+                        }
+                    }
+                    EntryKind::Dir if gitlinks.contains(&folded) => {}
+                    EntryKind::Dir if tracked_dirs.contains(&folded) => {
+                        next.push(Dir {
+                            path,
+                            tracked: true,
+                        });
+                    }
+                    EntryKind::Dir if !is_excluded(&path, true)? => next.push(Dir {
+                        path,
+                        tracked: false,
+                    }),
+                    EntryKind::Dir | EntryKind::Link | EntryKind::Other => {}
+                }
+            }
+        }
+        next.sort_by(|left, right| left.path.cmp(&right.path));
+        level = next;
+    }
+    Ok(stats)
+}
+
+/// A directory to list; `tracked` when the index has paths below it.
+struct Dir {
+    path: String,
+    tracked: bool,
+}
+
+/// The stat of each path below `root` that is a regular file. An error waits in the map until
+/// the path passes the exclusions, so an excluded path that cannot be read fails nothing.
+fn stat_files(
+    scan: &Scan<'_>,
+    root: &Path,
+    paths: Vec<String>,
+) -> Result<HashMap<String, io::Result<Stat>>> {
+    let work = || {
+        paths
+            .into_par_iter()
+            .map(|path| {
+                scan.check_deadline()?;
+                Ok(match fsmeta::lstat(&root.join(&path)) {
+                    Ok(stat) if stat.kind == EntryKind::File => Some((path, Ok(stat))),
+                    Ok(_) => None,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                    Err(error) => Some((path, Err(error))),
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+    };
+    let stats = in_stat_pool(work)?;
     Ok(stats.into_iter().flatten().collect())
 }
 
-#[derive(Debug, Default)]
-struct Untracked(Vec<String>);
-
-impl Delegate for Untracked {
-    fn emit(&mut self, entry: EntryRef<'_>, _directory_status: Option<Status>) -> Action {
-        let is_file = entry.disk_kind == Some(Kind::File);
-        if entry.status == Status::Untracked
-            && is_file
-            && let Ok(path) = std::str::from_utf8(entry.rela_path.as_ref())
-        {
-            self.0.push(path.to_owned());
-        }
-        Action::Continue(())
+/// Runs `work` in a small pool: on Windows, more threads opening files at once only contend.
+fn in_stat_pool<T: Send>(work: impl FnOnce() -> T + Send) -> T {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(limits::STAT_THREADS)
+            .build()
+            .ok()
+    });
+    match pool {
+        Some(pool) => pool.install(work),
+        None => work(),
     }
 }

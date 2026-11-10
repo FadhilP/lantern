@@ -1,6 +1,7 @@
 //! The refresh pipeline of one root: inventory, diff, parallel prepare, one writer, one commit.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
@@ -519,8 +520,17 @@ impl Job<'_> {
             });
         }
         let full_path = self.target.root.join(path);
-        let bytes = match fsmeta::read_stable(&full_path, &entry.stat, self.settings.max_file_size)?
-        {
+        // A directory listing can lag behind a file, so the read is checked against the file.
+        let current = match fsmeta::lstat(&full_path) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(Error::temporary(format!(
+                    "{path} vanished during the refresh"
+                )));
+            }
+            Err(error) => return Err(Error::io(&full_path, &error)),
+        };
+        let bytes = match fsmeta::read_stable(&full_path, &current, self.settings.max_file_size)? {
             Content::Text(bytes) => bytes,
             Content::Binary | Content::TooLarge => {
                 return Ok(Prepared::Known {

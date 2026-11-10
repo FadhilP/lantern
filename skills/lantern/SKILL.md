@@ -31,7 +31,7 @@ Pick by what you search for:
 
 Run the command from inside the repository, or pass `-C <dir>`. `-C` takes a directory, not a context count; for context lines use `--context N`. The first query on a new repository builds the index; later queries are fast. You do not need to run `lantern index` first.
 
-**Several queries in a row:** each query refreshes the index first (about 0.6 s on a large repository). When you chain queries and the files do not change between them, add `--stale-ok` to every query after the first: `lantern symbols A; lantern refs A --stale-ok`. Before a loop, run `lantern index > /dev/null` once, then use `--stale-ok` on every query in the loop. On a repository that was never indexed, `--stale-ok` exits 1.
+**Several queries in a row:** each query refreshes the index first (about 0.2 s on a large repository). When you chain queries and the files do not change between them, add `--stale-ok` to every query after the first: `lantern symbols A; lantern refs A --stale-ok`. Before a loop, run `lantern index > /dev/null` once, then use `--stale-ok` on every query in the loop. On a repository that was never indexed, `--stale-ok` exits 1.
 
 ## Read the output
 
@@ -78,6 +78,7 @@ Add `--json` only when a program parses the output. Each command then prints one
 - **Generated files** (lockfiles, files marked `linguist-generated` or `linguist-vendored` in `.gitattributes`) are left out of `symbols`, `refs`, and `graph`, and ranked last in `code`. Add `--include-generated` to include them.
 - **What is indexed.** In a Git repository: tracked files plus untracked files that Git does not ignore. Outside Git: all files except `.gitignore` matches and the defaults (dot-files, `node_modules/`, `dist/`, `build/`, `coverage/`, `target/`, `vendor/`). `.lanternignore` (gitignore syntax) excludes more in both. Files over 1 MiB (`--max-file-size`) and binary files are not searchable as text.
 - **Nested repositories** (submodules that are checked out) are indexed with the repository that contains them; their paths carry the submodule prefix.
+- **Windows: files open for writing.** In a Git repository on Windows, Lantern takes file metadata from directory listings, as Git does with `core.fscache`. It does not see an edit to a file that another process still holds open for writing until that process closes the file. It also does not see an edit made through another name of a hard-linked file until that name is opened. Editor saves close the file, so they are not affected.
 
 ## Handle errors
 
