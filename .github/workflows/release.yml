@@ -41,7 +41,8 @@ jobs:
           exe=lantern; [[ "${{ matrix.target }}" == *windows* ]] && exe=lantern.exe
           mkdir -p "npm/lantern/bin/${{ matrix.npm }}"
           cp "target/${{ matrix.target }}/release/$exe" "npm/lantern/bin/${{ matrix.npm }}/"
-          tar -czf "lantern-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" "$exe"
+          cp LICENSE "target/${{ matrix.target }}/release/"
+          tar -czf "lantern-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" "$exe" LICENSE
       - name: Smoke test through npm
         shell: bash
         run: |
@@ -99,6 +100,7 @@ jobs:
           # Artifacts lose the executable bit, and npm only restores it for `bin` entries.
           chmod +x bin/*/lantern
           cp -r ../../skills .
+          cp ../../LICENSE .
           npm pkg set version="${GITHUB_REF_NAME#v}"
           if npm view "@fadhilp/lantern@${GITHUB_REF_NAME#v}" version >/dev/null 2>&1; then
             echo "already published"

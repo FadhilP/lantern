@@ -112,7 +112,6 @@ Lockfiles and paths marked `linguist-generated` or `linguist-vendored` in `.gita
 
 - [CLI reference](docs/cli.md): every command, flag, output field, and exit code.
 - [Architecture](docs/architecture.md): sources, the shard layout, the refresh pipeline, and queries.
-- [Releasing](docs/releasing.md): the tag-driven release workflow and the npm setup.
 
 ## Development
 
@@ -127,4 +126,4 @@ cargo fmt --all
 
 ## License
 
-No license is chosen yet.
+[MIT](LICENSE)

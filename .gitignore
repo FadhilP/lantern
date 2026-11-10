@@ -1,3 +1,5 @@
 /target
 /npm/lantern/bin/*/
 /npm/lantern/skills
+/npm/lantern/LICENSE
+/docs/releasing.md

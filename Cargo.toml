@@ -6,6 +6,7 @@ members = ["crates/lantern-cli"]
 version = "0.3.0"
 edition = "2024"
 rust-version = "1.90"
+license = "MIT"
 repository = "https://github.com/fadhilp/lantern"
 
 [workspace.lints.rust]

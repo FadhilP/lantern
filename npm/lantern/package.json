@@ -2,6 +2,7 @@
   "name": "@fadhilp/lantern",
   "version": "0.0.0",
   "description": "Read-only code discovery for large codebases",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/fadhilp/lantern.git"
