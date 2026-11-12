@@ -256,7 +256,7 @@ fn deny_read(path: &std::path::Path) -> Option<std::fs::File> {
 
 /// Removes read permission until dropped; `None` when the user can read it anyway (root).
 #[cfg(unix)]
-fn deny_read(path: &std::path::Path) -> Option<impl Drop> {
+fn deny_read(path: &std::path::Path) -> Option<impl Drop + use<>> {
     use std::os::unix::fs::PermissionsExt;
     struct Restore(std::path::PathBuf);
     impl Drop for Restore {
