@@ -83,7 +83,7 @@ pub(crate) fn run(
                 kind: row.get(1)?,
                 line: row.get(2)?,
                 end_line: row.get(3)?,
-                signature: signature(&lines, row.get(2)?),
+                signature: signature(&lines, row.get(2)?, request.line_chars),
                 container: row.get(4)?,
                 children: Vec::new(),
             })

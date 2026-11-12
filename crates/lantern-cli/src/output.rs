@@ -3,8 +3,10 @@
 
 use std::io::Write;
 
+use crate::changes::{ChangedFile, ChangedLine, Move, SymbolStatus, Unparsed};
 use crate::error::{Error, ErrorKind};
 use crate::extract::SymbolKind;
+use crate::git::FileStatus;
 use crate::query::Page;
 use crate::query::code::CodeHit;
 use crate::query::graph::Graph;
@@ -70,8 +72,9 @@ impl Printer {
             };
             if !self.json {
                 let mut lines = text(rows);
+                // First, so `| head` cannot cut it off.
                 if let Some(cursor) = next_cursor {
-                    lines.push(format!("-- more: --cursor {cursor}"));
+                    lines.insert(0, format!("-- more: --cursor {cursor}"));
                 }
                 return joined(&lines, empty);
             }
@@ -232,6 +235,80 @@ pub fn code_lines(hits: &[CodeHit]) -> Vec<String> {
     lines
 }
 
+/// One heading per file with its status and line counts, then one line per changed definition
+/// and, with `--diff`, its `+line:text` and `-line:text` lines.
+pub fn change_lines(files: &[ChangedFile]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for file in files {
+        let mut notes = Vec::new();
+        match (file.status, &file.old_path) {
+            (FileStatus::Renamed, Some(old_path)) => notes.push(format!("renamed from {old_path}")),
+            (FileStatus::Copied, Some(old_path)) => notes.push(format!("copied from {old_path}")),
+            (FileStatus::Modified | FileStatus::Renamed | FileStatus::Copied, _) => {}
+            (FileStatus::Added, _) => notes.push("added".to_owned()),
+            (FileStatus::Deleted, _) => notes.push("deleted".to_owned()),
+            (FileStatus::Untracked, _) => notes.push("untracked".to_owned()),
+        }
+        notes.push(counts(file.added, file.removed));
+        notes.extend(file.unparsed.map(|unparsed| {
+            match unparsed {
+                Unparsed::Binary => "binary",
+                Unparsed::TooLarge => "larger than --max-file-size",
+                Unparsed::NoParser => "no parser",
+                Unparsed::TimedOut => "parsing ran out of time",
+                Unparsed::Unreadable => "unreadable",
+                Unparsed::OutOfSync => "the file differs from git's diff",
+            }
+            .to_owned()
+        }));
+        notes.retain(|note| !note.is_empty());
+        lines.push(if notes.is_empty() {
+            file.path.clone()
+        } else {
+            format!("{} ({})", file.path, notes.join(", "))
+        });
+        let changed = |line: &ChangedLine| format!("{}{}:{}", line.sign, line.line, line.text);
+        lines.extend(file.lines.iter().flatten().map(changed));
+        for symbol in &file.symbols {
+            let status = match symbol.status {
+                SymbolStatus::Added => "added",
+                SymbolStatus::Removed => "removed",
+                SymbolStatus::Modified => "modified",
+                SymbolStatus::Moved => "moved",
+            };
+            let mut row = format!(
+                "  {status} {} {} {}-{}",
+                symbol.kind.as_str(),
+                qualified(symbol.container.as_deref(), &symbol.name),
+                symbol.line,
+                symbol.end_line,
+            );
+            match &symbol.moved {
+                Some(Move::From(place)) => row += &format!(" from {}:{}", place.path, place.line),
+                Some(Move::To(place)) => row += &format!(" to {}:{}", place.path, place.line),
+                None => {}
+            }
+            let counts = counts(symbol.added, symbol.removed);
+            if !counts.is_empty() {
+                row += &format!(" ({counts})");
+            }
+            lines.push(row);
+            lines.extend(symbol.lines.iter().flatten().map(changed));
+        }
+    }
+    lines
+}
+
+/// `+3 -1`, without a zero side.
+fn counts(added: usize, removed: usize) -> String {
+    match (added, removed) {
+        (0, 0) => String::new(),
+        (added, 0) => format!("+{added}"),
+        (0, removed) => format!("-{removed}"),
+        (added, removed) => format!("+{added} -{removed}"),
+    }
+}
+
 /// One heading per run of references in the same file.
 pub fn ref_lines(hits: &[RefHit]) -> Vec<String> {
     let mut lines = Vec::new();
@@ -273,31 +350,31 @@ fn outline_lines(nodes: &[OutlineNode], depth: usize, lines: &mut Vec<String>) {
     }
 }
 
-/// Nodes as `id kind name path:line`, then edges as `from -> to kind at line N` of the `from`
-/// node's file.
+/// `-- truncated` first when cut, then nodes as `id kind name path:line`, then edges as
+/// `from -> to kind at line N` of the `from` node's file.
 fn graph_lines(graph: &Graph) -> Vec<String> {
-    let mut lines: Vec<String> = graph
-        .nodes
-        .iter()
-        .map(|node| {
-            let root = if graph.roots.contains(&node.id) {
-                " (root)"
-            } else {
-                ""
-            };
-            if node.kind == "file" {
-                return format!("{} file {}{root}", node.id, node.path);
-            }
-            format!(
-                "{} {} {} {}:{}{root}",
-                node.id,
-                node.kind,
-                qualified(node.container.as_deref(), &node.name),
-                node.path,
-                node.line
-            )
-        })
-        .collect();
+    let mut lines: Vec<String> = Vec::new();
+    if graph.truncated {
+        lines.push("-- truncated".to_owned());
+    }
+    lines.extend(graph.nodes.iter().map(|node| {
+        let root = if graph.roots.contains(&node.id) {
+            " (root)"
+        } else {
+            ""
+        };
+        if node.kind == "file" {
+            return format!("{} file {}{root}", node.id, node.path);
+        }
+        format!(
+            "{} {} {} {}:{}{root}",
+            node.id,
+            node.kind,
+            qualified(node.container.as_deref(), &node.name),
+            node.path,
+            node.line
+        )
+    }));
     lines.extend(graph.edges.iter().map(|edge| {
         format!(
             "{} -> {} {} at line {}",
@@ -309,9 +386,6 @@ fn graph_lines(graph: &Graph) -> Vec<String> {
     }));
     if !graph.unresolved.is_empty() {
         lines.push(format!("unresolved: {}", graph.unresolved.join(", ")));
-    }
-    if graph.truncated {
-        lines.push("-- truncated".to_owned());
     }
     lines
 }
@@ -340,7 +414,17 @@ fn joined(lines: &[String], empty: &str) -> String {
     if lines.is_empty() {
         return empty.to_owned();
     }
-    lines.join("\n")
+    // Each element is one line: a newline in a file name must not print a fake result line, and
+    // an escape sequence must not reach the terminal.
+    let escape = |line: &String| {
+        line.chars()
+            .map(|c| match c.is_control() && c != '\t' {
+                true => c.escape_debug().to_string(),
+                false => c.to_string(),
+            })
+            .collect::<String>()
+    };
+    lines.iter().map(escape).collect::<Vec<_>>().join("\n")
 }
 
 /// Absent fields cost an agent nothing to read, so null fields are left out.

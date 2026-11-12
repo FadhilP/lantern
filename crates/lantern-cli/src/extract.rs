@@ -631,9 +631,10 @@ fn one_based(position: usize) -> u32 {
     u32::try_from(position + 1).unwrap_or(u32::MAX)
 }
 
+/// The first `max` characters; a cut text ends in `…`, so the cut shows.
 pub(crate) fn truncate_chars(text: &str, max: usize) -> String {
     match text.char_indices().nth(max) {
-        Some((index, _)) => text[..index].to_owned(),
+        Some((index, _)) => format!("{}…", &text[..index]),
         None => text.to_owned(),
     }
 }

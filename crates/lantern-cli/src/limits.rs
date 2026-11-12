@@ -8,7 +8,7 @@ pub const DEFAULT_LIMIT: usize = 30;
 pub const DEFAULT_OUTLINE_LIMIT: usize = 100;
 pub const DEFAULT_CODE_LIMIT: usize = 10;
 pub const MAX_LIMIT: usize = 10_000;
-pub const DEFAULT_PER_FILE: usize = 20;
+pub const DEFAULT_PER_FILE: usize = 5;
 pub const MAX_PER_FILE: usize = 1_000;
 pub const MAX_CONTEXT: usize = 50;
 pub const DEFAULT_BODY_LIMIT: usize = 5;
@@ -18,8 +18,10 @@ pub const DEFAULT_GRAPH_NODES: usize = 200;
 pub const MAX_GRAPH_NODES: usize = 5_000;
 pub const MAX_QUERY_CHARS: usize = 4_000;
 
-/// Longest line text, in characters, that any output carries.
+/// Longest line text, in characters, that JSON output carries.
 pub(crate) const MAX_LINE_CHARS: usize = 500;
+/// Longest line text in the default text output; agents cut wider lines to about 130.
+pub(crate) const TEXT_LINE_CHARS: usize = 200;
 pub(crate) const MAX_SIGNATURE_CHARS: usize = 300;
 /// Longest body, in lines, that `symbols --body` prints per definition.
 pub(crate) const MAX_BODY_LINES: u32 = 100;

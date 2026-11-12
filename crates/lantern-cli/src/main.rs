@@ -1,9 +1,11 @@
 //! `lantern`: read-only code discovery for large codebases.
 
+mod changes;
 mod engine;
 mod error;
 mod extract;
 mod fsmeta;
+mod git;
 mod home;
 mod language;
 mod limits;
@@ -22,12 +24,13 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::changes::ChangesQuery;
 use crate::engine::{Lantern, Options};
 use crate::error::{Error, ErrorKind};
 use crate::extract::{RefKind, SymbolKind};
 use crate::limits::{
     DEFAULT_BODY_LIMIT, DEFAULT_CODE_LIMIT, DEFAULT_GRAPH_DEPTH, DEFAULT_GRAPH_NODES,
-    DEFAULT_LIMIT, DEFAULT_OUTLINE_LIMIT, DEFAULT_PER_FILE,
+    DEFAULT_LIMIT, DEFAULT_OUTLINE_LIMIT, DEFAULT_PER_FILE, MAX_LINE_CHARS, TEXT_LINE_CHARS,
 };
 use crate::output::Printer;
 use crate::query::code::{CodeQuery, CodeSort, looks_like_regex};
@@ -94,6 +97,8 @@ enum Command {
     Refs(RefsArgs),
     /// What calls X, and what does X call?
     Graph(GraphArgs),
+    /// Which definitions did a Git diff change?
+    Changes(ChangesArgs),
     /// What is in this file?
     Outline {
         /// One or more files; each gets its own page under a `== FILE` line.
@@ -123,6 +128,9 @@ struct SymbolsArgs {
     /// Print the source lines of each definition; the default --limit drops to 5.
     #[arg(long)]
     body: bool,
+    /// Also list prefix, initials, and substring matches when a name matches exactly.
+    #[arg(long)]
+    fuzzy: bool,
     #[command(flatten)]
     page: PageArgs,
 }
@@ -206,6 +214,23 @@ struct GraphArgs {
 }
 
 #[derive(Debug, Args)]
+struct ChangesArgs {
+    /// As `git diff` takes it: `A..B`, `A...B`, or `A` against the working tree. Without it, the
+    /// working tree and the index against HEAD, and untracked files.
+    #[arg(value_name = "RANGE")]
+    range: Option<String>,
+    /// Repeat to match any of several globs; `!GLOB` excludes.
+    #[arg(long, value_name = "GLOB")]
+    path: Vec<String>,
+    /// Print the changed lines. With NAME (`Container.name` too), only definitions with that
+    /// name. It takes the next word as NAME, so put RANGE before it.
+    #[arg(long, value_name = "NAME")]
+    diff: Option<Option<String>>,
+    #[command(flatten)]
+    page: PageArgs,
+}
+
+#[derive(Debug, Args)]
 struct PageArgs {
     #[arg(long, value_name = "N")]
     limit: Option<usize>,
@@ -220,10 +245,15 @@ struct PageArgs {
 }
 
 impl PageArgs {
-    fn request(&self, default_limit: usize) -> PageRequest {
+    fn request(&self, default_limit: usize, json: bool) -> PageRequest {
         PageRequest {
             limit: self.limit.unwrap_or(default_limit),
             cursor: self.cursor.clone(),
+            line_chars: if json {
+                MAX_LINE_CHARS
+            } else {
+                TEXT_LINE_CHARS
+            },
         }
     }
 }
@@ -281,9 +311,10 @@ fn run(cli: Cli, printer: &Printer) -> Result<(), Error> {
         Command::Code(args) => code(&lantern, &cwd, printer, args),
         Command::Refs(args) => refs(&lantern, &cwd, printer, args),
         Command::Graph(args) => graph(&lantern, &cwd, printer, args),
+        Command::Changes(args) => changes(&lantern, &cwd, printer, args),
         Command::Outline { files, page } => {
             for_each_query(printer, &page, files, |file, freshness| {
-                let request = page.request(DEFAULT_OUTLINE_LIMIT);
+                let request = page.request(DEFAULT_OUTLINE_LIMIT, printer.json());
                 let outline = lantern.outline(&cwd, &file, freshness, &request)?;
                 let note = incomplete_note(outline.symbols.incomplete);
                 printer.outline(&outline, page.max_bytes, &note)
@@ -327,6 +358,7 @@ fn symbols(
         path,
         include_generated,
         body,
+        fuzzy,
         page,
     } = args;
     let run = |query: Option<String>, freshness| {
@@ -337,8 +369,8 @@ fn symbols(
             path: path.clone(),
             include_generated,
             body,
-            // A body is long, so `--body` alone skips the near misses of an exact name.
-            exact_only: body && page.limit.is_none(),
+            // Agents piped `symbols X | head -2` for the exact hit.
+            exact_only: !fuzzy,
         };
         symbols_page(lantern, cwd, printer, &query, freshness, &page)
     };
@@ -408,7 +440,12 @@ fn symbols_page(
     } else {
         DEFAULT_LIMIT
     };
-    let found = lantern.symbols(cwd, query, freshness, &page.request(default_limit))?;
+    let found = lantern.symbols(
+        cwd,
+        query,
+        freshness,
+        &page.request(default_limit, printer.json()),
+    )?;
     let note = incomplete_note(found.page.incomplete);
     let Some(text) = &query.query else {
         let empty = if note.is_empty() {
@@ -431,13 +468,19 @@ fn symbols_page(
         ),
         _ => format!("no results; for a field, a key, or text, try: lantern code \"{text}\"{note}"),
     };
-    printer.page(
-        &found.page,
-        page.max_bytes,
-        &[],
-        &empty,
-        output::symbol_lines,
-    )
+    let hidden = found.hidden_near_misses;
+    let extra = if hidden > 0 {
+        vec![("fuzzy_hidden", serde_json::json!(hidden))]
+    } else {
+        Vec::new()
+    };
+    printer.page(&found.page, page.max_bytes, &extra, &empty, |hits| {
+        let mut lines = output::symbol_lines(hits);
+        if hidden > 0 {
+            lines.insert(0, format!("-- more: --fuzzy ({hidden})"));
+        }
+        lines
+    })
 }
 
 fn code(lantern: &Lantern, cwd: &Path, printer: &Printer, args: CodeArgs) -> Result<(), Error> {
@@ -474,7 +517,7 @@ fn code(lantern: &Lantern, cwd: &Path, printer: &Printer, args: CodeArgs) -> Res
         cwd,
         &query,
         freshness(page.stale_ok),
-        &page.request(DEFAULT_CODE_LIMIT),
+        &page.request(DEFAULT_CODE_LIMIT, printer.json()),
     )?;
     let note = incomplete_note(Incomplete {
         unparsed_files: 0,
@@ -506,6 +549,30 @@ fn code_empty(query: &CodeQuery) -> &'static str {
     "no results"
 }
 
+fn changes(
+    lantern: &Lantern,
+    cwd: &Path,
+    printer: &Printer,
+    args: ChangesArgs,
+) -> Result<(), Error> {
+    let ChangesArgs {
+        range,
+        path,
+        diff,
+        page,
+    } = args;
+    let empty = match (&diff, path.is_empty()) {
+        (Some(Some(name)), _) => format!(
+            "no results; no changed definition is named {name}. `--diff` takes the next word as the name, so put a range before it"
+        ),
+        (_, false) => "no results; no changed file matches --path".to_owned(),
+        (_, true) => "no results; no changes".to_owned(),
+    };
+    let query = ChangesQuery { range, path, diff };
+    let found = lantern.changes(cwd, &query, &page.request(DEFAULT_LIMIT, printer.json()))?;
+    printer.page(&found, page.max_bytes, &[], &empty, output::change_lines)
+}
+
 fn refs(lantern: &Lantern, cwd: &Path, printer: &Printer, args: RefsArgs) -> Result<(), Error> {
     let query = RefsQuery {
         name: args.name,
@@ -517,7 +584,7 @@ fn refs(lantern: &Lantern, cwd: &Path, printer: &Printer, args: RefsArgs) -> Res
         cwd,
         &query,
         freshness(args.page.stale_ok),
-        &args.page.request(DEFAULT_LIMIT),
+        &args.page.request(DEFAULT_LIMIT, printer.json()),
     )?;
     let extra = [("resolution", serde_json::json!("name"))];
     let note = incomplete_note(found.incomplete);

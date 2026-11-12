@@ -13,6 +13,8 @@ crates/lantern-cli    the `lantern` binary
   src/refresh.rs      one refresh: diff, prepare, commit
   src/workspace.rs    root resolution
   src/query/          symbols, code, refs, graph, outline, pages
+  src/git.rs          the git CLI, for `changes`
+  src/changes.rs      changed lines to changed definitions
   queries/<lang>/     tree-sitter tag queries
   tests/cli/          integration tests that run the binary
 npm/                  npm package: launcher and install script
@@ -65,6 +67,10 @@ Each query opens the shard read-only in one read transaction. Every statement of
 - `refs`: an exact name lookup with the enclosing definition.
 - `graph`: a breadth-first expansion over calls, resolved by name.
 - `outline`: one file's symbols, nested by line range and by container.
+
+## Changes
+
+`changes` does not use the index. It is the only command that starts another program: one `git diff --raw -z --patch --unified=0 --find-copies` call (plus `git rev-parse --revs-only` for a `RANGE`, which tells a single revision compared with the working tree from a range, and `git ls-files --others` for the working tree), then one `git cat-file --batch` for the blobs of the page's files. Paths and blob ids come from the NUL-separated raw records; each patch section is matched to its record by its `diff --git` line, and hunk lines are read by the counts in the hunk header. A working-tree side is read from the disk, unless git named a blob it stored (an entry outside a sparse checkout is compared with the index). Each side must have the diff's lines at their line numbers, or the file is `out_of_sync`: a clean filter can make git's lines differ from the disk. Both sides are parsed in parallel with the same extractor as a refresh, and each changed line goes to the innermost definition around it on its side. Moves are found from text: the changed lines of every file in the diff, without filler, are indexed by trimmed text, and a wholly added or removed definition is moved when its lines appear in a row on the other side, with the same indentation relative to the first line. The other side is then parsed, and a definition there must span exactly the matched lines, so the text is not part of a longer change. The index is keyed by the first two lines, since many definitions start with the same one (`@Override`). Each line carries its hunk number, so a match in the same hunk (a reindent or a line-ending change in place) is not a move. So a move does not depend on which files the page parses; the cost is reading every untracked file. Git runs with `diff.autoRefreshIndex=false`, so it does not rewrite `.git/index`, and with options that keep external diff drivers, text conversion, colors, and prefixes out of the output. Git's own diff was measured against gix's: the same results, within 110 ms on large ranges, while gix added 3.4 MB to the binary; parsing the changed files costs more than either.
 
 ## Platform notes
 

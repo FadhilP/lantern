@@ -12,7 +12,7 @@ use super::{
 use crate::error::Result;
 use crate::extract::{SymbolKind, truncate_chars};
 use crate::language::FileFlags;
-use crate::limits::{MAX_BODY_LINES, MAX_LINE_CHARS};
+use crate::limits::MAX_BODY_LINES;
 use crate::store::shard::{self, initials};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -27,7 +27,7 @@ pub struct SymbolQuery {
     /// Adds the source lines of each definition.
     pub body: bool,
     /// When a name matches exactly (in any case), drops the prefix, initials, and substring
-    /// matches.
+    /// matches, and counts them in [`SymbolsFound::hidden_near_misses`].
     pub exact_only: bool,
 }
 
@@ -61,6 +61,8 @@ pub struct SymbolsFound {
     pub page: Page<SymbolHit>,
     /// For `Container.name` that matched nothing: other containers that define `name`.
     pub other_containers: Vec<String>,
+    /// Near misses that `exact_only` dropped.
+    pub hidden_near_misses: usize,
 }
 
 /// The match tier, a match inside a word, the name length, the kind rank, a test file, and the
@@ -92,17 +94,17 @@ pub(crate) fn run(
                     .is_some_and(|language| names.contains(&language))
             })
     };
-    let (mut rows, other_containers) = match &query.query {
+    let (mut rows, other_containers, hidden_near_misses) = match &query.query {
         Some(text) => {
             validate_text("the symbol query", text)?;
             let keep = |row: &Row| opened.accept(&row.hit.path, &filter) && passes(row);
             ranked(opened, text, query.exact_only, needed.rows, keep)?
         }
-        None => (listed(opened, &filter, needed.rows, passes)?, Vec::new()),
+        None => (listed(opened, &filter, needed.rows, passes)?, Vec::new(), 0),
     };
     // Only the page's own rows are shown; the rest need no text.
     let shown = rows.iter_mut().skip(needed.offset).take(request.limit);
-    add_text(opened, shown, query.body)?;
+    add_text(opened, shown, query.body, request.line_chars)?;
     let page = opened.page(
         &description,
         request,
@@ -112,18 +114,19 @@ pub(crate) fn run(
     Ok(SymbolsFound {
         page,
         other_containers,
+        hidden_near_misses,
     })
 }
 
-/// The best `rows` definitions whose name matches `text`, best first, and for `Container.name`
-/// that matched nothing, other containers that define `name`.
+/// The best `rows` definitions whose name matches `text`, best first; for `Container.name` that
+/// matched nothing, other containers that define `name`; and the near misses `exact_only` hid.
 fn ranked(
     opened: &Opened,
     text: &str,
     exact_only: bool,
     rows: usize,
     keep: impl Fn(&Row) -> bool,
-) -> Result<(Vec<Row>, Vec<String>)> {
+) -> Result<(Vec<Row>, Vec<String>, usize)> {
     let (container, name) = split_qualified(text);
     let mut found = candidates(&opened.conn, name)?;
     found.retain(|row| keep(row));
@@ -151,8 +154,11 @@ fn ranked(
         })
         .collect();
     let is_exact = |ranked: &Ranked| ranked.key.0 <= Tier::ExactIgnoringCase;
+    let mut hidden = 0;
     if exact_only && all.iter().any(is_exact) {
+        let before = all.len();
         all.retain(is_exact);
+        hidden = before - all.len();
     }
 
     let order = |a: &Ranked, b: &Ranked| {
@@ -171,7 +177,7 @@ fn ranked(
     }
     all.sort_unstable_by(order);
     let found = all.into_iter().map(|ranked| ranked.row).collect();
-    Ok((found, other_containers))
+    Ok((found, other_containers, hidden))
 }
 
 /// The first `rows` definitions in the files that pass `filter`, in path and line order.
@@ -298,6 +304,7 @@ fn add_text<'row>(
     opened: &Opened,
     rows: impl Iterator<Item = &'row mut Row>,
     body: bool,
+    line_chars: usize,
 ) -> Result<()> {
     let mut rows_of: HashMap<i64, Vec<&mut Row>> = HashMap::new();
     for row in rows {
@@ -307,14 +314,14 @@ fn add_text<'row>(
         let text = shard::blob_text(&opened.conn, blob_id)?;
         let lines: Vec<&str> = text.lines().collect();
         for row in rows {
-            row.hit.signature = signature(&lines, row.hit.line);
+            row.hit.signature = signature(&lines, row.hit.line, line_chars);
             if !body {
                 continue;
             }
             let first = row.start_line;
             let last = row.hit.end_line.min(first + MAX_BODY_LINES - 1);
             let text = (first..=last)
-                .map(|line| truncate_chars(line_at(&lines, line), MAX_LINE_CHARS))
+                .map(|line| truncate_chars(line_at(&lines, line), line_chars))
                 .collect();
             row.hit.body = Some(Body { line: first, text });
         }

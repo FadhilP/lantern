@@ -1,6 +1,6 @@
 # Lantern
 
-Lantern is a read-only code discovery CLI for large codebases. It keeps a local SQLite index of code text, symbols, and references, and it answers five questions fast, for people and for agents:
+Lantern is a read-only code discovery CLI for large codebases. It keeps a local SQLite index of code text, symbols, and references, and it answers six questions fast, for people and for agents:
 
 ```sh
 lantern symbols getUserById      # Where is X defined?
@@ -8,10 +8,11 @@ lantern code "retry\(" --regex   # Where does this text or pattern occur?
 lantern refs getUserById         # Who uses X?
 lantern graph getUserById        # What calls X, and what does X call?
 lantern outline src/user.ts      # What is in this file?
+lantern changes main...HEAD      # Which definitions did this branch change?
 ```
 
 - **Always fresh.** Every query refreshes the index first and reads only changed files, so results match the disk.
-- **Read-only.** Lantern never writes inside your repository. The index lives in your user data directory.
+- **Read-only.** Lantern never writes inside your repository. The index lives in your user data directory. `changes` reads git's diff without an index and does not let git rewrite `.git/index`.
 - **Git-aware.** In a Git repository it indexes tracked files plus untracked files that Git does not ignore. Checked-out submodules are part of the same index. Outside Git it indexes a folder with `.gitignore` rules and sensible default excludes, after you run `lantern index` there once.
 - **Built for agents.** JSON output, stable cursors, a `--max-bytes` output budget, and exit codes that say what to do next.
 - **13 grammars.** Symbols and references for C, C++, C#, Dart, Go, Java, JavaScript, PHP, Python, Ruby, Rust, TypeScript, and TSX. `code` searches every text file.
@@ -58,7 +59,7 @@ $ lantern refs loadUser --json
              "enclosing":{"name":"main","kind":"function"}}]}
 ```
 
-Large results come in pages. A last line `-- more: --cursor <value>` (or `next_cursor` in JSON) gives the next page with `--cursor`, and `--max-bytes 8K` caps the size. Add `--stale-ok` to skip the refresh when you run many queries in a row.
+Large results come in pages. A first line `-- more: --cursor <value>` (or `next_cursor` in JSON) gives the next page with `--cursor`, and `--max-bytes 8K` caps the size. Add `--stale-ok` to skip the refresh when you run many queries in a row.
 
 ## Compared with grep and ripgrep
 
@@ -68,7 +69,7 @@ Measured on [microsoft/vscode](https://github.com/microsoft/vscode) at `819bb82`
 
 | Command | Time | Output |
 |---|--:|---|
-| `lantern symbols TextModel` | 178 ms (15 ms) | 3.8 KB: the first page of 30 definitions, exact matches first |
+| `lantern symbols TextModel` | 183 ms (15 ms) | 1.5 KB: the 11 exact definitions, and a count of the 169 looser matches that `--fuzzy` adds |
 | `rg -n -w TextModel` | 847 ms | 1.48 MB: all 476 lines that use the name |
 | `rg -n -w -M 500 TextModel` | 853 ms | 70 KB, 476 lines |
 | `rg -n -w "class TextModel"` | 833 ms | 0.2 KB, 3 lines |
@@ -78,7 +79,7 @@ Measured on [microsoft/vscode](https://github.com/microsoft/vscode) at `819bb82`
 
 | Command | Time | Output |
 |---|--:|---|
-| `lantern code onDidChangeContent --limit 10000` | 228 ms (59 ms) | 55 KB |
+| `lantern code onDidChangeContent --limit 10000 --per-file 1000` | 229 ms (59 ms) | 51 KB |
 | `rg -n -i onDidChangeContent` | 830 ms | 606 KB |
 | `rg -n -i -M 500 onDidChangeContent` | 841 ms | 69 KB |
 | `grep -rn -i onDidChangeContent .` | 3,676 ms | 607 KB |
@@ -87,19 +88,19 @@ Measured on [microsoft/vscode](https://github.com/microsoft/vscode) at `819bb82`
 
 | Command | Time | Output |
 |---|--:|---|
-| `lantern refs getWordAtPosition` | 179 ms (12 ms) | 5.4 KB: the first page of 30 calls, each with its calling function |
+| `lantern refs getWordAtPosition` | 188 ms (13 ms) | 5.5 KB: the first page of 30 calls, each with its calling function |
 | `rg -n -w getWordAtPosition` | 837 ms | 52 KB: 80 lines of calls, definitions, and comments |
 
 ### What is in `textModel.ts` (2,745 lines)?
 
 | Command | Time | Output |
 |---|--:|---|
-| `lantern outline src/vs/editor/common/model/textModel.ts` | 174 ms (9 ms) | 8.4 KB: all 231 definitions, nested |
+| `lantern outline src/vs/editor/common/model/textModel.ts` | 181 ms (9 ms) | 8.6 KB: all 237 definitions, nested |
 | `cat src/vs/editor/common/model/textModel.ts` | 10 ms | 112 KB |
 
 ### What the numbers show
 
-- **Output size.** Lantern prints less because it pages results, cuts lines at 500 characters, and answers with definitions instead of every line that contains the name. One test fixture in vscode has a 1.4 MB line, so plain `rg` and `grep` print megabytes for a common name. `rg -M 500` removes most of that gap for text search.
+- **Output size.** Lantern prints less because it pages results, cuts lines at 200 characters (500 in JSON), and answers with definitions instead of every line that contains the name. One test fixture in vscode has a 1.4 MB line, so plain `rg` and `grep` print megabytes for a common name. `rg -M 500` removes most of that gap for text search.
 - **Speed.** With the refresh, each query here was about 4 times faster than `rg`; the refresh takes most of that time. With `--stale-ok`, queries take 9–59 ms.
 - **When `rg` is better.** A precise pattern such as `rg -w "class TextModel"` prints less than `symbols`, if you know the syntax of the language. Reading a whole file with `cat` is faster than `outline`, but it prints 13 times more.
 - **Costs.** The first query builds the index: 18 s for vscode. The index takes 321 MB of disk, about 80% of the working tree. A query after you change one file takes about 0.5 s, because it parses and stores that file again.

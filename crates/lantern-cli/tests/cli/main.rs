@@ -1,5 +1,6 @@
 //! CLI integration tests: the real binary against temporary fixture trees and real SQLite files.
 
+mod changes;
 mod common;
 mod folder;
 mod git_source;

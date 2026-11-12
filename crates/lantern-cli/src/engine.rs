@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use crate::changes::{self, ChangedFile, ChangesQuery, Move};
 use crate::error::{Error, ErrorKind, Result};
 use crate::home::{Home, default_home};
 use crate::limits::MAX_MAX_FILE_SIZE;
@@ -297,6 +298,38 @@ impl Lantern {
             graph.nodes.iter_mut().map(|node| &mut node.path),
         );
         Ok(graph)
+    }
+
+    /// Reads git's diff and parses the changed files; it neither needs nor refreshes an index.
+    pub fn changes(
+        &self,
+        cwd: &Path,
+        query: &ChangesQuery,
+        page: &PageRequest,
+    ) -> Result<Page<ChangedFile>> {
+        let (root, scope) = workspace::repository(cwd)?.ok_or_else(|| {
+            Error::usage(format!(
+                "{} is not inside a Git repository, and `changes` reads git's diff",
+                cwd.display()
+            ))
+        })?;
+        let mut found = changes::run(&root, &scope, query, page, self.settings.max_file_size)?;
+        rebase(
+            &scope,
+            found.rows.iter_mut().flat_map(|file| {
+                let moves = file
+                    .symbols
+                    .iter_mut()
+                    .filter_map(|symbol| match &mut symbol.moved {
+                        Some(Move::From(place) | Move::To(place)) => Some(&mut place.path),
+                        None => None,
+                    });
+                std::iter::once(&mut file.path)
+                    .chain(&mut file.old_path)
+                    .chain(moves)
+            }),
+        );
+        Ok(found)
     }
 
     /// Lists the symbols of one file, which can be outside the start directory.

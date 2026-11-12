@@ -8,7 +8,6 @@ use super::{Opened, Page, PageRequest, PathFilter, line_at, validate_limit, vali
 use crate::error::Result;
 use crate::extract::{RefKind, SymbolKind, truncate_chars};
 use crate::language::FileFlags;
-use crate::limits::MAX_LINE_CHARS;
 use crate::store::shard;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -116,7 +115,7 @@ pub(crate) fn run(
         let lines: Vec<&str> = text.lines().collect();
         for position in positions {
             let hit = &mut rows[position].hit;
-            hit.text = truncate_chars(line_at(&lines, hit.line).trim(), MAX_LINE_CHARS);
+            hit.text = truncate_chars(line_at(&lines, hit.line).trim(), request.line_chars);
         }
     }
     opened.page(

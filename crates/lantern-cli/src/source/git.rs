@@ -186,7 +186,7 @@ fn gitlink_child(
         Err(error) => return Err(Error::io(&path, &error)),
     };
     let inside = child.starts_with(workspace) && child != parent;
-    if !inside || child.join(".git").symlink_metadata().is_err() {
+    if !inside || gix::discover::is_git(&child.join(".git")).is_err() {
         return Ok(None);
     }
     let repo = open_worktree(&child)?;

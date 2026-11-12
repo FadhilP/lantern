@@ -13,7 +13,7 @@ use super::{Opened, Page, PageRequest, PathFilter, language_names, validate_limi
 use crate::error::{Error, Result};
 use crate::extract::truncate_chars;
 use crate::language::FileFlags;
-use crate::limits::{MAX_CONTEXT, MAX_LINE_CHARS, MAX_PER_FILE};
+use crate::limits::{MAX_CONTEXT, MAX_PER_FILE};
 use crate::store::{shard, trigram};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
@@ -172,7 +172,7 @@ pub(crate) fn run(
             .min(MAX_VERIFY_BATCH);
         let batch = &candidates[next..(next + size).min(candidates.len())];
         verify(opened, batch, &mut verified, |text| {
-            let mut found = search(text, &matcher, query.per_file, context)?;
+            let mut found = search(text, &matcher, query.per_file, context, request.line_chars)?;
             if !scored.is_empty() {
                 let text = trigram::folded(text);
                 found.score = score(
@@ -343,12 +343,18 @@ fn regex_error_hint(pattern: &str) -> String {
 
 /// Line-oriented matching, like `rg`: a match never spans lines. Context windows of nearby
 /// matches do not overlap, so each line is shown once. `per_file` 0 only counts.
-fn search(text: &str, matcher: &Regex, per_file: usize, context: usize) -> Option<FileMatches> {
+fn search(
+    text: &str,
+    matcher: &Regex,
+    per_file: usize,
+    context: usize,
+    line_chars: usize,
+) -> Option<FileMatches> {
     if !matcher.is_match(text) {
         return None;
     }
     let lines: Vec<&str> = text.lines().collect();
-    let cut = |line: &&str| truncate_chars(line, MAX_LINE_CHARS);
+    let cut = |line: &&str| truncate_chars(line, line_chars);
     let around = |range: std::ops::Range<usize>| {
         (context > 0).then(|| lines[range].iter().map(cut).collect::<Vec<String>>())
     };
@@ -374,7 +380,7 @@ fn search(text: &str, matcher: &Regex, per_file: usize, context: usize) -> Optio
         matches.push(LineMatch {
             line: index + 1,
             column: found.start() + 1,
-            text: match_text(line, found.start()),
+            text: match_text(line, found.start(), line_chars),
             before: around(before_start..index),
             after: around(index + 1..after_end),
         });
@@ -387,20 +393,20 @@ fn search(text: &str, matcher: &Regex, per_file: usize, context: usize) -> Optio
     })
 }
 
-/// The match line cut to `MAX_LINE_CHARS`. When the match starts too late to show, the text is
+/// The match line cut to `max` characters. When the match starts too late to show, the text is
 /// a window that starts shortly before the match, after a `…`.
-fn match_text(line: &str, start: usize) -> String {
-    let lead = MAX_LINE_CHARS / 5;
+fn match_text(line: &str, start: usize, max: usize) -> String {
+    let lead = max / 5;
     let start_char = line[..start].chars().count();
-    if start_char <= MAX_LINE_CHARS - lead {
-        return truncate_chars(line, MAX_LINE_CHARS);
+    if start_char <= max - lead {
+        return truncate_chars(line, max);
     }
     let skip = start_char - lead;
     let window = line
         .char_indices()
         .nth(skip)
         .map_or("", |(byte, _)| &line[byte..]);
-    format!("…{}", truncate_chars(window, MAX_LINE_CHARS))
+    format!("…{}", truncate_chars(window, max))
 }
 
 /// What a match requires of the text, as trigram-searchable literals.

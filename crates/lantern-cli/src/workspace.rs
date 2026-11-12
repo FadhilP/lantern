@@ -22,16 +22,7 @@ pub(crate) struct Resolved {
 /// Resolves `path` to its Git working tree, or to itself as a folder root. A checked-out
 /// submodule resolves to the repository that contains it, which indexes its files.
 pub(crate) fn resolve(path: &Path, home: &Home) -> Result<Resolved> {
-    let start = paths::canonical(path).map_err(|error| match error.kind() {
-        io::ErrorKind::NotFound => Error::usage(format!("{} does not exist", path.display())),
-        _ => Error::io(path, &error),
-    })?;
-    if !start.is_dir() {
-        return Err(Error::usage(format!(
-            "{} is not a directory",
-            start.display()
-        )));
-    }
+    let start = start_dir(path)?;
     let Some(mut root) = git_root(&start) else {
         return Ok(Resolved {
             target: target(start, SourceKind::Folder),
@@ -59,10 +50,35 @@ pub(crate) fn resolve(path: &Path, home: &Home) -> Result<Resolved> {
     })
 }
 
-/// The nearest directory at or above `dir` that holds a `.git` entry.
+/// The nearest Git working tree at or above `path`, as git finds it, and `path` relative to it.
+pub(crate) fn repository(path: &Path) -> Result<Option<(PathBuf, String)>> {
+    let start = start_dir(path)?;
+    let Some(root) = git_root(&start) else {
+        return Ok(None);
+    };
+    let scope = paths::relative(root, &start)
+        .ok_or_else(|| Error::failure(format!("path is not valid UTF-8: {}", start.display())))?;
+    Ok(Some((root.to_path_buf(), scope)))
+}
+
+fn start_dir(path: &Path) -> Result<PathBuf> {
+    let start = paths::canonical(path).map_err(|error| match error.kind() {
+        io::ErrorKind::NotFound => Error::usage(format!("{} does not exist", path.display())),
+        _ => Error::io(path, &error),
+    })?;
+    if !start.is_dir() {
+        return Err(Error::usage(format!(
+            "{} is not a directory",
+            start.display()
+        )));
+    }
+    Ok(start)
+}
+
+/// The nearest directory at or above `dir` whose `.git` is a repository, as git finds it.
 fn git_root(dir: &Path) -> Option<&Path> {
     dir.ancestors()
-        .find(|dir| dir.join(".git").symlink_metadata().is_ok())
+        .find(|dir| gix::discover::is_git(&dir.join(".git")).is_ok())
 }
 
 /// The repository above `root` whose index holds `root` as a gitlink.

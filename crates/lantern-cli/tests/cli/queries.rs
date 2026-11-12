@@ -203,7 +203,7 @@ fn symbol_ranking_puts_exact_then_prefix_then_initials_then_substring() {
         strings(&["parseTreeNode", "buildWorkspaceTree", "streetreeIndex"]),
         "a match at a word start ranks first, then the shorter name"
     );
-    let top = f.ok(&["symbols", "bWT", "--limit", "3"]);
+    let top = f.ok(&["symbols", "bWT", "--fuzzy", "--limit", "3"]);
     assert_eq!(
         names(&top),
         strings(&["bWT", "bWTExtra", "buildWorkspaceTree"])
@@ -443,6 +443,46 @@ fn graph_takes_a_name_qualified_by_its_container() {
 }
 
 #[test]
+fn an_exact_name_hides_fuzzy_matches_until_fuzzy_is_given() {
+    let f = Fixture::new();
+    f.write(
+        "a.ts",
+        "export function load() {}\nexport function loadAll() {}\nexport function reload() {}\n",
+    );
+    let exact = f.text(&["symbols", "load"]);
+    assert_eq!(
+        exact,
+        "-- more: --fuzzy (2)\na.ts:1-1 function: export function load() {}\n"
+    );
+    assert_eq!(
+        f.ok(&["symbols", "load"])["fuzzy_hidden"],
+        serde_json::json!(2)
+    );
+    assert_eq!(
+        names(&f.ok(&["symbols", "load", "--limit", "10"])),
+        strings(&["load"])
+    );
+    assert_eq!(
+        names(&f.ok(&["symbols", "load", "--fuzzy"])),
+        strings(&["load", "loadAll", "reload"])
+    );
+    assert_eq!(
+        names(&f.ok(&["symbols", "loa"])),
+        strings(&["load", "loadAll", "reload"])
+    );
+}
+
+#[test]
+fn code_shows_five_matches_per_file_by_default_and_says_so() {
+    let f = Fixture::new();
+    f.write("a.ts", "needle\n".repeat(8));
+    let page = f.text(&["code", "needle"]);
+    assert!(page.starts_with("a.ts (8 matches, 5 shown)\n"), "{page}");
+    let all = f.text(&["code", "needle", "--per-file", "8"]);
+    assert_eq!(all.lines().count(), 9, "{all}");
+}
+
+#[test]
 fn symbols_without_a_query_list_definitions_in_path_and_line_order() {
     let f = Fixture::new();
     f.write("src/b.ts", "function second() {}\nclass Third {}\n");
@@ -591,7 +631,7 @@ fn repeated_path_globs_match_any_of_them() {
 }
 
 #[test]
-fn text_output_groups_by_file_and_ends_a_page_with_its_cursor() {
+fn text_output_groups_by_file_and_starts_a_page_with_its_cursor() {
     let f = Fixture::new();
     f.write(
         "a.ts",
@@ -616,12 +656,12 @@ fn text_output_groups_by_file_and_ends_a_page_with_its_cursor() {
         "a.ts (3 matches, 1 shown)\n1:function load() {}\n2-function main() {\nb.ts\n1:load();\n"
     );
     let page = f.text(&["outline", "a.ts", "--limit", "1"]);
-    let (first, more) = page
+    let (more, first) = page
         .trim_end()
         .split_once('\n')
-        .expect("a row and a cursor");
-    assert_eq!(first, "1-1 function load");
+        .expect("a cursor and a row");
     assert!(more.starts_with("-- more: --cursor "), "{page}");
+    assert_eq!(first, "1-1 function load");
 }
 
 #[test]
@@ -770,6 +810,24 @@ fn non_unicode() -> std::ffi::OsString {
 fn non_unicode() -> std::ffi::OsString {
     use std::os::unix::ffi::OsStringExt;
     std::ffi::OsString::from_vec(vec![0xff])
+}
+
+/// Windows does not allow a newline in a file name.
+#[cfg(unix)]
+#[test]
+fn a_newline_in_a_file_name_prints_no_fake_result_line() {
+    let f = Fixture::new();
+    f.write(
+        "a\nb.ts:1-1 constant: export const FAKE = 1;\n\x1b[2Kc.ts",
+        "export const X = 1;\n",
+    );
+
+    let text = f.text(&["symbols", "X"]);
+
+    assert_eq!(
+        text,
+        "a\\nb.ts:1-1 constant: export const FAKE = 1;\\n\\u{1b}[2Kc.ts:1-1 constant: export const X = 1;\n"
+    );
 }
 
 #[test]
@@ -921,17 +979,27 @@ fn code_context_shows_each_line_once_a_late_match_shows_and_files_list_alone() {
     let f = Fixture::new();
     f.write("a.ts", "one\nneedle\ntwo\nneedle\nthree\n");
     f.write("b.ts", format!("{}needle\n", "x".repeat(600)));
+    f.write("c.ts", format!("needle{}\n", "y".repeat(600)));
     assert_eq!(
         f.text(&["code", "needle", "--context", "1", "--path", "a.ts"]),
         "a.ts\n1-one\n2:needle\n3-two\n4:needle\n5-three\n"
     );
     assert_eq!(
         f.text(&["code", "needle", "--path", "b.ts"]),
-        format!("b.ts\n1:…{}needle\n", "x".repeat(100))
+        format!("b.ts\n1:…{}needle\n", "x".repeat(40))
     );
     assert_eq!(
+        f.text(&["code", "needle", "--path", "c.ts"]),
+        format!("c.ts\n1:needle{}…\n", "y".repeat(194))
+    );
+    let json = f.ok(&["code", "needle", "--path", "c.ts"]);
+    let text = json["results"][0]["matches"][0]["text"]
+        .as_str()
+        .expect("match text");
+    assert_eq!(text, format!("needle{}…", "y".repeat(494)));
+    assert_eq!(
         f.text(&["code", "needle", "-l", "--sort", "path"]),
-        "a.ts (2 matches)\nb.ts (1 matches)\n"
+        "a.ts (2 matches)\nb.ts (1 matches)\nc.ts (1 matches)\n"
     );
 }
 
@@ -958,8 +1026,8 @@ fn outline_takes_several_files_and_a_body_keeps_to_the_exact_name() {
     assert!(printed.ends_with("== b.ts\n1-1 class B\n"), "{printed}");
     let exact = f.text(&["symbols", "load", "--body"]);
     assert!(!exact.contains("loadAll"), "{exact}");
-    let limited = f.text(&["symbols", "load", "--body", "--limit", "5"]);
-    assert!(limited.contains("loadAll"), "{limited}");
+    let fuzzy = f.text(&["symbols", "load", "--body", "--fuzzy"]);
+    assert!(fuzzy.contains("loadAll"), "{fuzzy}");
 }
 
 #[test]
@@ -997,10 +1065,9 @@ fn symbol_bodies_are_the_file_lines_from_the_doc_comment_and_page_whole() {
     let paged = f.text(&["symbols", "step", "--body", "--max-bytes", &budget]);
     assert_eq!(paged.matches("  return").count(), 1, "{paged}");
     let cursor = paged
-        .split("-- more: --cursor ")
-        .nth(1)
-        .expect("a cursor")
-        .trim();
+        .lines()
+        .find_map(|line| line.strip_prefix("-- more: --cursor "))
+        .expect("a cursor");
     let rest = f.text(&[
         "symbols",
         "step",

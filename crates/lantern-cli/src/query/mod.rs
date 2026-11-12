@@ -34,6 +34,8 @@ pub enum Freshness {
 pub struct PageRequest {
     pub limit: usize,
     pub cursor: Option<String>,
+    /// Longer line text is cut, with `…`.
+    pub line_chars: usize,
 }
 
 /// One page of results.
@@ -49,6 +51,18 @@ pub struct Page<T> {
 }
 
 impl<T> Page<T> {
+    /// The same page with its rows replaced.
+    pub fn try_map<U>(self, map: impl FnOnce(Vec<T>) -> Result<Vec<U>>) -> Result<Page<U>> {
+        Ok(Page {
+            freshness: self.freshness,
+            indexed_at: self.indexed_at,
+            rows: map(self.rows)?,
+            next_cursor: self.next_cursor,
+            incomplete: self.incomplete,
+            cursor: self.cursor,
+        })
+    }
+
     /// A cursor that resumes at `row` of this page; used when a byte cap drops rows.
     #[must_use]
     pub fn cursor_at(&self, row: usize) -> String {
@@ -112,39 +126,8 @@ impl Opened {
         paths::is_within(path, &self.scope) && filter.matches(path)
     }
 
-    /// Decodes the request cursor and checks it belongs to this query and index state.
     fn start(&self, query: &str, request: &PageRequest) -> Result<CursorBase> {
-        let query = blake3::hash(query.as_bytes()).to_hex()[..16].to_owned();
-        let offset = match &request.cursor {
-            None => 0,
-            Some(cursor) => {
-                let mut parts = cursor.splitn(3, '.');
-                let (Some(offset), Some(for_query), Some(state)) =
-                    (parts.next(), parts.next(), parts.next())
-                else {
-                    return Err(Error::usage(INVALID_CURSOR));
-                };
-                let offset: usize = offset.parse().map_err(|_| Error::usage(INVALID_CURSOR))?;
-                if offset.checked_add(request.limit + 1).is_none() {
-                    return Err(Error::usage(INVALID_CURSOR));
-                }
-                if for_query != query {
-                    return Err(Error::usage("the cursor belongs to a different query"));
-                }
-                if state != self.state {
-                    return Err(Error::new(
-                        ErrorKind::StaleCursor,
-                        "results changed; run the query again without --cursor",
-                    ));
-                }
-                offset
-            }
-        };
-        Ok(CursorBase {
-            offset,
-            query,
-            state: self.state.clone(),
-        })
+        start(&self.state, query, request)
     }
 
     /// Why an empty result may be empty.
@@ -173,24 +156,13 @@ impl Opened {
         filter: &PathFilter,
         rows: Vec<T>,
     ) -> Result<Page<T>> {
-        let cursor = self.start(query, request)?;
-        let mut rows: Vec<T> = rows.into_iter().skip(cursor.offset).collect();
-        let next_cursor =
-            (rows.len() > request.limit).then(|| cursor.encode(cursor.offset + request.limit));
-        rows.truncate(request.limit);
-        let incomplete = if rows.is_empty() {
-            self.incomplete(filter)?
-        } else {
-            shard::Incomplete::default()
-        };
-        Ok(Page {
-            freshness: self.freshness,
-            indexed_at: self.indexed_at,
-            rows,
-            next_cursor,
-            incomplete,
-            cursor,
-        })
+        let mut page = page(&self.state, query, request, rows)?;
+        page.freshness = self.freshness;
+        page.indexed_at = self.indexed_at;
+        if page.rows.is_empty() {
+            page.incomplete = self.incomplete(filter)?;
+        }
+        Ok(page)
     }
 
     /// Which sorted rows a page needs.
@@ -201,6 +173,65 @@ impl Opened {
             rows: offset + request.limit + 1,
         })
     }
+}
+
+/// Decodes the request cursor and checks it belongs to this query and to `state`, which names
+/// what the rows came from.
+fn start(state: &str, query: &str, request: &PageRequest) -> Result<CursorBase> {
+    let query = blake3::hash(query.as_bytes()).to_hex()[..16].to_owned();
+    let offset = match &request.cursor {
+        None => 0,
+        Some(cursor) => {
+            let mut parts = cursor.splitn(3, '.');
+            let (Some(offset), Some(for_query), Some(for_state)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                return Err(Error::usage(INVALID_CURSOR));
+            };
+            let offset: usize = offset.parse().map_err(|_| Error::usage(INVALID_CURSOR))?;
+            if offset.checked_add(request.limit + 1).is_none() {
+                return Err(Error::usage(INVALID_CURSOR));
+            }
+            if for_query != query {
+                return Err(Error::usage("the cursor belongs to a different query"));
+            }
+            if for_state != state {
+                return Err(Error::new(
+                    ErrorKind::StaleCursor,
+                    "results changed; run the query again without --cursor",
+                ));
+            }
+            offset
+        }
+    };
+    Ok(CursorBase {
+        offset,
+        query,
+        state: state.to_owned(),
+    })
+}
+
+/// Cuts one page from rows sorted in their final order. For a result without a shard, the page
+/// reads as fresh.
+pub(crate) fn page<T>(
+    state: &str,
+    query: &str,
+    request: &PageRequest,
+    rows: Vec<T>,
+) -> Result<Page<T>> {
+    let cursor = start(state, query, request)?;
+    let mut rows: Vec<T> = rows.into_iter().skip(cursor.offset).collect();
+    let next_cursor =
+        (rows.len() > request.limit).then(|| cursor.encode(cursor.offset + request.limit));
+    rows.truncate(request.limit);
+    Ok(Page {
+        freshness: Freshness::Walk,
+        indexed_at: None,
+        rows,
+        next_cursor,
+        incomplete: shard::Incomplete::default(),
+        cursor,
+    })
 }
 
 /// The sorted rows a page needs: `rows` counts the skipped rows before `offset`, the page, and
@@ -338,8 +369,11 @@ pub(crate) fn validate_limit(request: &PageRequest) -> Result<()> {
 }
 
 /// A definition's line as results show it.
-pub(crate) fn signature(lines: &[&str], line: u32) -> String {
-    truncate_chars(line_at(lines, line).trim(), MAX_SIGNATURE_CHARS)
+pub(crate) fn signature(lines: &[&str], line: u32, line_chars: usize) -> String {
+    truncate_chars(
+        line_at(lines, line).trim(),
+        line_chars.min(MAX_SIGNATURE_CHARS),
+    )
 }
 
 /// The 1-based `line` of `str::lines` output; empty past the end.
