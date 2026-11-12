@@ -103,3 +103,29 @@
 (import_clause (identifier) @name) @reference.import
 (namespace_import (identifier) @name) @reference.import
 (export_statement (export_clause (export_specifier name: (identifier) @name)) source: (_)) @reference.import
+
+; top-level `const` that holds a value, not a function (those are functions above)
+
+(program [
+  (lexical_declaration
+    kind: "const"
+    (variable_declarator
+      name: (identifier) @name
+      value: [
+        (number) (string) (template_string) (identifier) (member_expression)
+        (subscript_expression) (object) (array) (new_expression) (call_expression)
+        (binary_expression) (unary_expression) (ternary_expression) (await_expression)
+        (parenthesized_expression) (regex) (true) (false) (null) (undefined)
+      ]) @definition.constant)
+  (export_statement
+    declaration: (lexical_declaration
+      kind: "const"
+      (variable_declarator
+        name: (identifier) @name
+        value: [
+          (number) (string) (template_string) (identifier) (member_expression)
+          (subscript_expression) (object) (array) (new_expression) (call_expression)
+          (binary_expression) (unary_expression) (ternary_expression) (await_expression)
+          (parenthesized_expression) (regex) (true) (false) (null) (undefined)
+        ]) @definition.constant))
+])

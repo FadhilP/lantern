@@ -1,6 +1,7 @@
 //! SQLite storage: one shard per root.
 
 pub(crate) mod shard;
+pub(crate) mod trigram;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,7 +12,7 @@ use rusqlite::{Connection, ErrorCode, OpenFlags};
 
 use crate::error::{Error, Result};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Opens a database with the shared pragmas and runs `schema` when `user_version` is 0.
 fn open(path: &Path, schema: &str) -> Result<Connection> {
@@ -52,7 +53,7 @@ fn open_read_only(path: &Path) -> Result<Option<Connection>> {
     Ok(Some(conn))
 }
 
-const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn connect(path: &Path, flags: OpenFlags) -> Result<Connection> {
     let conn = Connection::open_with_flags(path, flags)
@@ -116,6 +117,23 @@ pub(crate) fn column_name<T>(
     parse(name).ok_or_else(|| {
         rusqlite::types::FromSqlError::Other(format!("unknown {what} {name:?}").into())
     })
+}
+
+/// True when a newer Lantern wrote the shard, so this one must leave it and its files alone.
+pub(crate) fn is_newer(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    Ok(schema_version(path)? > SCHEMA_VERSION)
+}
+
+/// 0 while the schema is not committed.
+pub(crate) fn schema_version(path: &Path) -> Result<i64> {
+    let conn = connect(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    user_version(&conn)
 }
 
 fn user_version(conn: &Connection) -> Result<i64> {

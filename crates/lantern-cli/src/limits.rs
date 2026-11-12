@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const MAX_MAX_FILE_SIZE: u64 = 64 << 20;
 
 pub const DEFAULT_LIMIT: usize = 30;
+pub const DEFAULT_OUTLINE_LIMIT: usize = 100;
 pub const DEFAULT_CODE_LIMIT: usize = 10;
 pub const MAX_LIMIT: usize = 10_000;
 pub const DEFAULT_PER_FILE: usize = 20;
@@ -43,7 +44,8 @@ pub(crate) fn max_entries() -> u64 {
 }
 
 pub(crate) fn max_nested() -> usize {
-    test_override("LANTERN_TEST_MAX_NESTED").map_or(1_000, |value| value as usize)
+    test_override("LANTERN_TEST_MAX_NESTED")
+        .map_or(1_000, |value| usize::try_from(value).unwrap_or(usize::MAX))
 }
 
 /// Milliseconds since the Unix epoch.

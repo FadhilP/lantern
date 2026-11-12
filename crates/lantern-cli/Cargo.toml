@@ -21,7 +21,7 @@ ignore = "0.4"
 rayon = "1.12"
 regex = "1.13"
 regex-syntax = "0.8"
-rusqlite = { version = "0.41", features = ["bundled", "functions", "backup"] }
+rusqlite = { version = "0.41", features = ["bundled", "backup"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
@@ -38,7 +38,7 @@ tree-sitter-python = "0.25"
 tree-sitter-ruby = "0.23"
 tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
-zstd = "0.14"
+zstd = "0.14.3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

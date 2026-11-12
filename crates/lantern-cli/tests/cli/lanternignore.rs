@@ -91,17 +91,48 @@ fn removed_content_is_not_left_in_the_shard_or_its_wal() {
 }
 
 #[test]
+fn removed_text_leaves_no_trigram_postings() {
+    let f = Fixture::new();
+    // Over one block of blob ids, with text whose fold or decoding could differ between add and remove.
+    let tricky: [&[u8]; 4] = [
+        b"Kelvin \xE2\x84\xAA sign",
+        b"long \xC5\xBF s",
+        b"bad \xFF\xFE utf8",
+        b"crlf\r\nline",
+    ];
+    for i in 0..300 {
+        let mut content = format!("file {i} body\n").into_bytes();
+        content.extend_from_slice(tricky[i % tricky.len()]);
+        f.write(&format!("f{i}.txt"), content);
+    }
+    f.write("copy.txt", "file 0 body\nKelvin \u{212A} sign");
+    f.ok(&["index"]);
+    for i in (0..300).step_by(2) {
+        f.write(&format!("f{i}.txt"), format!("edited {i} \u{3BC}\n"));
+    }
+    f.ok(&["index"]);
+    // Removing the replaced texts must keep the postings of the texts that stay.
+    assert_eq!(files_with(&f, &f.root, " body").len(), 151);
+    for i in 0..300 {
+        f.remove(&format!("f{i}.txt"));
+    }
+    f.remove("copy.txt");
+    f.write("empty.txt", "");
+    f.ok(&["index"]);
+    let rows: i64 = rusqlite::Connection::open(f.shard())
+        .expect("open shard")
+        .query_row("SELECT count(*) FROM trigrams", [], |row| row.get(0))
+        .expect("count trigram rows");
+    assert_eq!(rows, 0);
+}
+
+#[test]
 fn a_blocked_checkpoint_fails_only_index_and_the_next_refresh_finishes_it() {
     let f = Fixture::new();
     f.write("a.ts", "export function a() {}\n");
     f.write("b.ts", "export function b() {}\n");
     f.ok(&["index"]);
-    let shard = fs::read_dir(f.home.join("roots"))
-        .expect("roots dir")
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "sqlite"))
-        .expect("one shard");
+    let shard = f.shard();
     let reader = rusqlite::Connection::open(&shard).expect("open shard");
     reader
         .execute_batch("BEGIN; SELECT count(*) FROM files;")
@@ -125,12 +156,7 @@ fn a_rebuild_blocked_by_a_reader_keeps_the_checkpoint_pending() {
     let f = Fixture::new();
     f.write("a.ts", "export function a() {}\n");
     f.ok(&["index"]);
-    let shard = fs::read_dir(f.home.join("roots"))
-        .expect("roots dir")
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "sqlite"))
-        .expect("one shard");
+    let shard = f.shard();
     let pending = || -> i64 {
         rusqlite::Connection::open(&shard)
             .expect("open shard")

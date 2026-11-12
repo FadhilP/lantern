@@ -127,6 +127,8 @@ pub(crate) struct FileFlags(pub u8);
 impl FileFlags {
     pub const GENERATED: u8 = 1;
     pub const TEST: u8 = 2;
+    /// Set by a refresh that could not open or read the file; the next refresh reads it again.
+    pub const UNREADABLE: u8 = 4;
 
     pub fn classify(path: &str, generated_by_attributes: bool) -> Self {
         let mut bits = 0;

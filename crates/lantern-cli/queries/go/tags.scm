@@ -51,3 +51,14 @@
 (var_declaration (var_spec name: (identifier) @name))
 
 (const_declaration (const_spec name: (identifier) @name))
+
+; package-level constants and variables
+
+(source_file
+  (const_declaration (const_spec name: (identifier) @name) @definition.constant))
+
+(source_file
+  (var_declaration [
+    (var_spec name: (identifier) @name) @definition.variable
+    (var_spec_list (var_spec name: (identifier) @name) @definition.variable)
+  ]))

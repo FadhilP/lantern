@@ -29,6 +29,10 @@ const CORPUS: &[(&str, &[u8])] = &[
         b"caf\xe9 retry( here\nplain foobar line\n",
     ),
     ("config.yaml", b"retries: 3\nendpoint: x\n"),
+    (
+        "docs/units.txt",
+        "took 5 \u{b5}s, \u{17f}ome heat in \u{212a}elvin\n".as_bytes(),
+    ),
 ];
 
 fn corpus() -> Fixture {
@@ -105,6 +109,9 @@ fn code_search_finds_exactly_what_a_line_scan_finds() {
         ("ünïcode", false, false),
         ("café", false, false),
         (r"retr(y|ies)", true, false),
+        ("5 \u{3bc}s", false, false),
+        ("some heat", false, false),
+        ("kelvin", false, false),
     ];
     for &(pattern, regex, case_sensitive) in cases {
         assert_eq!(
@@ -116,8 +123,66 @@ fn code_search_finds_exactly_what_a_line_scan_finds() {
 }
 
 #[test]
+fn code_ranks_more_alternatives_before_more_repeats() {
+    let f = Fixture::new();
+    f.write("one.ts", "alpha alpha alpha alpha\n");
+    f.write("both.ts", "alpha\nbeta\n");
+    f.write("few.ts", "beta\n");
+    f.write("many.ts", "beta beta beta\n");
+    let ranked = |args: &[&str]| -> Vec<String> {
+        f.ok(args)["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .map(|hit| hit["path"].as_str().expect("path").to_owned())
+            .collect()
+    };
+    assert_eq!(
+        ranked(&["code", "alpha|beta", "--regex"]),
+        strings(&["both.ts", "one.ts", "many.ts", "few.ts"])
+    );
+    assert_eq!(
+        ranked(&["code", "beta"]),
+        strings(&["many.ts", "both.ts", "few.ts"])
+    );
+}
+
+#[test]
+fn code_ranks_by_folded_counts_beyond_the_first_batch() {
+    let f = Fixture::new();
+    for index in 0..100 {
+        f.write(&format!("a{index:03}.ts"), "beta\n");
+    }
+    f.write("z.ts", "beta beta beta\n");
+    let top = f.ok(&["code", "BETA", "--limit", "1"]);
+    assert_eq!(crate::common::paths(&top), strings(&["z.ts"]));
+}
+
+#[test]
+fn code_search_follows_edits_and_removals() {
+    let f = Fixture::new();
+    for index in 0..6 {
+        f.write(&format!("f{index}.ts"), format!("needle {index}\n"));
+    }
+    f.ok(&["index"]);
+    let found = |pattern: &str| crate::common::paths(&f.ok(&["code", pattern]));
+    for round in 0..3 {
+        f.write("f0.ts", format!("haystack {round}\n"));
+        f.remove(&format!("f{}.ts", round + 1));
+        f.write(&format!("g{round}.ts"), "needle again\n");
+        let mut expected: Vec<String> =
+            (round + 2..6).map(|index| format!("f{index}.ts")).collect();
+        expected.extend((0..=round).map(|index| format!("g{index}.ts")));
+        expected.sort();
+        assert_eq!(found("needle"), expected, "round {round}");
+        assert_eq!(found(&format!("haystack {round}")), strings(&["f0.ts"]));
+    }
+}
+
+#[test]
 fn invalid_patterns_and_escaping_paths_are_usage_errors() {
     let f = corpus();
+    f.ok(&["index"]);
     assert_eq!(f.lantern(&["code", "(", "--regex"]).code, 2);
     assert_eq!(
         f.lantern(&["code", "x", "--path", "../elsewhere/**"]).code,
@@ -194,6 +259,10 @@ fn pages_concatenate_and_a_changed_index_invalidates_the_cursor() {
 
     let first = f.ok(&["symbols", "item", "--limit", "10"]);
     let cursor = first["next_cursor"].as_str().expect("cursor").to_owned();
+    let (_, rest) = cursor.split_once('.').expect("cursor offset");
+    let huge = format!("{}.{rest}", usize::MAX);
+    let overflow = f.lantern(&["symbols", "item", "--limit", "10", "--cursor", &huge]);
+    assert_eq!(overflow.code, 2, "{}", overflow.stderr);
     f.ok(&["index"]);
     assert_eq!(
         f.lantern(&["symbols", "item", "--limit", "10", "--cursor", &cursor])
@@ -253,7 +322,7 @@ fn graph_fixture() -> Fixture {
 fn edges(graph: &Value) -> BTreeSet<(String, String)> {
     let nodes = graph["nodes"].as_array().expect("nodes");
     let name = |id: &Value| {
-        nodes[id.as_u64().expect("id") as usize]["name"]
+        nodes[usize::try_from(id.as_u64().expect("id")).expect("id fits usize")]["name"]
             .as_str()
             .expect("name")
             .to_owned()
@@ -337,8 +406,17 @@ fn outline_nests_members_in_line_order() {
 fn max_bytes_below_one_row_is_a_usage_error() {
     let f = Fixture::new();
     numbered(&f, 3);
+    f.ok(&["index"]);
     let run = f.lantern(&["symbols", "item", "--max-bytes", "60"]);
     assert_eq!(run.code, 2, "{}", run.stderr);
+    let needed = run
+        .stderr
+        .split("needs ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .unwrap_or_else(|| panic!("no size in: {}", run.stderr));
+    let fitted = f.lantern(&["symbols", "item", "--max-bytes", needed]);
+    assert_eq!(fitted.code, 0, "{}", fitted.stderr);
 }
 
 #[test]
@@ -349,6 +427,52 @@ fn graph_callers_follow_the_path_filter() {
     assert_eq!(edges(&all), pairs(&[("mid", "leaf"), ("far", "leaf")]));
     let scoped = f.ok(&["graph", "leaf", "--direction", "callers", "--path", "a.ts"]);
     assert_eq!(edges(&scoped), pairs(&[("mid", "leaf")]));
+}
+
+#[test]
+fn graph_takes_a_name_qualified_by_its_container() {
+    let f = Fixture::new();
+    f.write(
+        "a.ts",
+        "class Cart {\n  total() { sum(); }\n}\nclass Order {\n  total() { tax(); }\n}\nfunction sum() {}\nfunction tax() {}\n",
+    );
+    for query in ["Cart.total", "cart::total"] {
+        let graph = f.ok(&["graph", query, "--direction", "callees"]);
+        assert_eq!(edges(&graph), pairs(&[("total", "sum")]), "{query}");
+    }
+}
+
+#[test]
+fn symbols_without_a_query_list_definitions_in_path_and_line_order() {
+    let f = Fixture::new();
+    f.write("src/b.ts", "function second() {}\nclass Third {}\n");
+    f.write("src/a.ts", "function first() {}\n");
+    f.write("lib/c.ts", "function elsewhere() {}\n");
+    assert_eq!(
+        names(&f.ok(&["symbols", "--path", "src"])),
+        strings(&["first", "second", "Third"])
+    );
+    assert_eq!(
+        names(&f.ok(&["symbols", "--kind", "function", "--limit", "2"])),
+        strings(&["elsewhere", "first"])
+    );
+    let (paged, pages) = all_pages(&f, &["symbols", "--limit", "1"]);
+    assert_eq!(
+        (paged, pages),
+        (strings(&["elsewhere", "first", "second", "Third"]), 4)
+    );
+}
+
+#[test]
+fn an_empty_result_tells_when_no_indexed_file_matches_the_path() {
+    let f = Fixture::new();
+    f.write("src/a.ts", "function load() {}\n");
+    f.write("build/out.ts", "function load() {}\n");
+    let note = "No indexed file matches --path";
+    let ignored = f.text(&["code", "load", "--path", "build/**"]);
+    assert!(ignored.contains(note), "{ignored}");
+    let indexed = f.text(&["code", "missing", "--path", "src/**"]);
+    assert!(!indexed.contains(note), "{indexed}");
 }
 
 #[test]
@@ -471,12 +595,12 @@ fn text_output_groups_by_file_and_ends_a_page_with_its_cursor() {
     let f = Fixture::new();
     f.write(
         "a.ts",
-        "function load() {}\nfunction main() {\n  load();\n  load();\n}\n",
+        "function load() {}\nfunction main() {\n  load();\n  load(load());\n}\n",
     );
     f.write("b.ts", "load();\n");
     assert_eq!(
         f.text(&["refs", "load"]),
-        "a.ts\n3 call in main: load();\n4 call in main: load();\nb.ts\n1 call: load();\n"
+        "a.ts\n3:3 call in main: load();\n4:3 call in main: load(load());\n4:8 call in main: load(load());\nb.ts\n1:1 call: load();\n"
     );
     assert_eq!(
         f.text(&[
@@ -623,6 +747,32 @@ Needle
 }
 
 #[test]
+fn a_non_unicode_argument_is_an_error_not_a_panic() {
+    let f = Fixture::new();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_lantern"))
+        .arg("-C")
+        .arg(non_unicode())
+        .arg("status")
+        .env("LANTERN_HOME", &f.home)
+        .output()
+        .expect("run lantern");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("lantern: "), "{stderr}");
+}
+
+#[cfg(windows)]
+fn non_unicode() -> std::ffi::OsString {
+    use std::os::windows::ffi::OsStringExt;
+    std::ffi::OsString::from_wide(&[0xD800])
+}
+
+#[cfg(unix)]
+fn non_unicode() -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    std::ffi::OsString::from_vec(vec![0xff])
+}
+
+#[test]
 fn empty_results_point_from_a_wrong_guess_to_what_exists() {
     let f = Fixture::new();
     f.write(
@@ -646,6 +796,183 @@ fn empty_results_point_from_a_wrong_guess_to_what_exists() {
         missing.stderr.contains("named user.ts: lib/user.ts"),
         "{}",
         missing.stderr
+    );
+    let folder = f.lantern(&["outline", "lib"]);
+    assert_eq!(folder.code, 2);
+    assert!(
+        folder.stderr.contains("is a folder") && folder.stderr.contains("lib/user.ts"),
+        "{}",
+        folder.stderr
+    );
+}
+
+#[test]
+fn grep_alternation_and_a_literal_paren_in_a_regex_explain_themselves() {
+    let f = Fixture::new();
+    f.write("a.ts", "getStats(1);\n");
+    let regex = f.text(&["code", r"getStats\|load", "--regex"]);
+    assert!(regex.contains(r"`\|` matches a literal `|`"), "{regex}");
+    let literal = f.text(&["code", r"getStats\|load("]);
+    assert!(
+        literal.contains("add --regex") && literal.contains("`a|b`"),
+        "{literal}"
+    );
+    let unclosed = f.lantern(&["code", r"getStats\|load(", "--regex"]);
+    assert_eq!(unclosed.code, 2);
+    let error: Value = serde_json::from_str(&unclosed.stderr).expect("error document");
+    let message = error["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(r"write `\(`") && message.contains("`a|b`"),
+        "{message}"
+    );
+}
+
+#[test]
+fn excluded_path_globs_drop_their_matches() {
+    let f = Fixture::new();
+    f.write("src/a.ts", "export const needle = 1;\n");
+    f.write("src/a.test.ts", "export const needle = 2;\n");
+    f.write("lib/b.ts", "export const needle = 3;\n");
+    let excluded = f.ok(&["code", "needle", "--path", "!src/**", "--sort", "path"]);
+    assert_eq!(crate::common::paths(&excluded), strings(&["lib/b.ts"]));
+    let narrowed = f.ok(&[
+        "code",
+        "needle",
+        "--path",
+        "src/**",
+        "--path",
+        "!*.test.ts",
+        "--sort",
+        "path",
+    ]);
+    assert_eq!(crate::common::paths(&narrowed), strings(&["src/a.ts"]));
+    let folder = f.ok(&["code", "needle", "--path", "src", "--sort", "path"]);
+    assert_eq!(
+        crate::common::paths(&folder),
+        strings(&["src/a.test.ts", "src/a.ts"])
+    );
+    let not_folder = f.ok(&["code", "needle", "--path", "!src/", "--sort", "path"]);
+    assert_eq!(crate::common::paths(&not_folder), strings(&["lib/b.ts"]));
+}
+
+#[test]
+fn only_a_git_repository_is_indexed_by_a_query_and_the_home_folder_needs_force() {
+    let f = Fixture::new();
+    f.write("a.ts", "export const needle = 1;\n");
+    let plain_folder = f.lantern(&["code", "needle"]);
+    assert_eq!(plain_folder.code, 2, "{}", plain_folder.stderr);
+    assert!(
+        plain_folder.stderr.contains("ask the user"),
+        "{}",
+        plain_folder.stderr
+    );
+    let root = f.root.to_str().expect("UTF-8 root");
+    let as_home = [("HOME", root), ("USERPROFILE", root)];
+    assert_eq!(f.lantern_in(&f.root, &["index"], &as_home).code, 2);
+    assert_eq!(
+        f.lantern_in(&f.root, &["index", "--force"], &as_home).code,
+        0
+    );
+    let found = f.lantern_in(&f.root, &["code", "needle"], &as_home);
+    assert_eq!(crate::common::paths(&found.json), strings(&["a.ts"]));
+}
+
+#[test]
+fn symbols_take_several_queries_and_queries_take_a_list_of_kinds() {
+    let f = Fixture::new();
+    f.write(
+        "a.ts",
+        "export class Shop {}\nexport enum ShopKind { Red }\nexport function shopNow() {}\n",
+    );
+    assert_eq!(
+        f.text(&["symbols", "shopNow", "missing_name"]),
+        "== shopNow
+a.ts:3-3 function: export function shopNow() {}
+== missing_name
+no results; for a field, a key, or text, try: lantern code \"missing_name\"
+"
+    );
+    assert_eq!(f.lantern(&["symbols", "Shop", "shopNow"]).code, 2);
+    let kinds = f.ok(&["symbols", "shop", "--kind", "enum,function"]);
+    let found: BTreeSet<String> = names(&kinds).into_iter().collect();
+    assert_eq!(
+        found,
+        BTreeSet::from(["ShopKind".to_owned(), "shopNow".to_owned()])
+    );
+    f.write("b.ts", "import { shopNow } from \"./a\";\nshopNow();\n");
+    let ref_kinds = |kinds: &str| -> BTreeSet<String> {
+        let found = f.ok(&["refs", "shopNow", "--kind", kinds]);
+        found["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .map(|row| row["kind"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    };
+    assert_eq!(ref_kinds("call"), BTreeSet::from(["call".to_owned()]));
+    assert_eq!(
+        ref_kinds("call,import"),
+        BTreeSet::from(["call".to_owned(), "import".to_owned()])
+    );
+}
+
+#[test]
+fn code_context_shows_each_line_once_a_late_match_shows_and_files_list_alone() {
+    let f = Fixture::new();
+    f.write("a.ts", "one\nneedle\ntwo\nneedle\nthree\n");
+    f.write("b.ts", format!("{}needle\n", "x".repeat(600)));
+    assert_eq!(
+        f.text(&["code", "needle", "--context", "1", "--path", "a.ts"]),
+        "a.ts\n1-one\n2:needle\n3-two\n4:needle\n5-three\n"
+    );
+    assert_eq!(
+        f.text(&["code", "needle", "--path", "b.ts"]),
+        format!("b.ts\n1:…{}needle\n", "x".repeat(100))
+    );
+    assert_eq!(
+        f.text(&["code", "needle", "-l", "--sort", "path"]),
+        "a.ts (2 matches)\nb.ts (1 matches)\n"
+    );
+}
+
+#[test]
+fn outline_takes_several_files_and_a_body_keeps_to_the_exact_name() {
+    let f = Fixture::new();
+    f.write(
+        "a.ts",
+        "export function load() {}\nexport function loadAll() {}\n",
+    );
+    f.write("b.ts", "export class B {}\n");
+    assert_eq!(
+        f.text(&["outline", "a.ts", "b.ts"]),
+        "== a.ts\n1-1 function load\n2-2 function loadAll\n== b.ts\n1-1 class B\n"
+    );
+    let partial = std::process::Command::new(env!("CARGO_BIN_EXE_lantern"))
+        .args(["outline", "a.ts", "missing.ts", "b.ts"])
+        .current_dir(&f.root)
+        .env("LANTERN_HOME", &f.home)
+        .output()
+        .expect("run lantern");
+    assert_eq!(partial.status.code(), Some(1));
+    let printed = String::from_utf8_lossy(&partial.stdout);
+    assert!(printed.ends_with("== b.ts\n1-1 class B\n"), "{printed}");
+    let exact = f.text(&["symbols", "load", "--body"]);
+    assert!(!exact.contains("loadAll"), "{exact}");
+    let limited = f.text(&["symbols", "load", "--body", "--limit", "5"]);
+    assert!(limited.contains("loadAll"), "{limited}");
+}
+
+#[test]
+fn a_constructor_is_listed_only_without_its_type() {
+    let f = Fixture::new();
+    f.write("Svc.java", "class Svc {\n  Svc() {}\n}\n");
+    assert_eq!(
+        f.text(&["symbols", "Svc"]),
+        "Svc.java:1-3 class: class Svc {\n"
+    );
+    assert_eq!(
+        f.text(&["symbols", "Svc", "--kind", "method"]),
+        "Svc.java:2-2 method in Svc: Svc() {}\n"
     );
 }
 

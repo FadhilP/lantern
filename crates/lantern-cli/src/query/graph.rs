@@ -12,6 +12,7 @@ use crate::extract::{RefKind, SymbolKind};
 use crate::language::FileFlags;
 use crate::limits::{MAX_GRAPH_DEPTH, MAX_GRAPH_NODES};
 use crate::query::Freshness;
+use crate::query::symbols::split_qualified;
 use crate::store::shard;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
@@ -27,7 +28,8 @@ pub struct GraphQuery {
     pub direction: Direction,
     pub depth: usize,
     pub max_nodes: usize,
-    pub kind: Option<SymbolKind>,
+    /// Empty means any kind.
+    pub kind: Vec<SymbolKind>,
     pub path: Vec<String>,
     pub include_generated: bool,
 }
@@ -44,10 +46,9 @@ pub struct Graph {
     pub truncated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unresolved: Vec<String>,
-    /// Files whose symbols are missing because parsing ran out of time; counted only for an
-    /// empty graph.
+    /// Counted only for an empty graph.
     #[serde(skip)]
-    pub unparsed_files: u64,
+    pub incomplete: shard::Incomplete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -146,10 +147,21 @@ pub(crate) fn run(opened: &Opened, query: &GraphQuery) -> Result<Graph> {
         unresolved: BTreeSet::new(),
         by_name: HashMap::new(),
     };
-    let name = query.name.trim();
+    let (container, name) = split_qualified(&query.name);
+    let in_container = |definition: &Definition| {
+        container.is_none_or(|container| {
+            definition
+                .container
+                .as_deref()
+                .is_some_and(|found| found.eq_ignore_ascii_case(container))
+        })
+    };
     let mut roots = Vec::new();
     for definition in builder.definitions_named(name)? {
-        if query.kind.is_some_and(|kind| kind != definition.kind) {
+        if !query.kind.is_empty() && !query.kind.contains(&definition.kind) {
+            continue;
+        }
+        if !in_container(&definition) {
             continue;
         }
         if let Some(id) = builder.node(&Vertex::Definition(definition)) {
@@ -178,10 +190,10 @@ pub(crate) fn run(opened: &Opened, query: &GraphQuery) -> Result<Graph> {
         }
     }
 
-    let unparsed_files = if builder.nodes.is_empty() {
-        shard::unparsed_files(&opened.conn)?
+    let incomplete = if builder.nodes.is_empty() {
+        opened.incomplete(&filter)?
     } else {
-        0
+        shard::Incomplete::default()
     };
     Ok(Graph {
         freshness: opened.freshness,
@@ -192,7 +204,7 @@ pub(crate) fn run(opened: &Opened, query: &GraphQuery) -> Result<Graph> {
         edges: builder.edges,
         truncated: builder.truncated,
         unresolved: builder.unresolved.into_iter().collect(),
-        unparsed_files,
+        incomplete,
     })
 }
 
@@ -277,22 +289,22 @@ impl Builder<'_> {
              JOIN files f ON f.blob_id = r.blob_id AND (?2 OR f.flags & 1 = 0)
              LEFT JOIN symbols es ON es.id = r.enclosing
              LEFT JOIN names en ON en.id = es.name_id
-             WHERE n.name = ?1 AND r.kind = 'call'",
+             WHERE n.name = ?1 AND r.kind = ?3",
         )?;
-        let rows =
-            statement.query_map(params![definition.name, self.include_generated], |row| {
-                Ok((
-                    row.get::<_, RefKind>(0)?,
-                    row.get::<_, u32>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<SymbolKind>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<u32>>(7)?,
-                    FileFlags(row.get(8)?),
-                ))
-            })?;
+        let parameters = params![definition.name, self.include_generated, RefKind::Call];
+        let rows = statement.query_map(parameters, |row| {
+            Ok((
+                row.get::<_, RefKind>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<SymbolKind>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<u32>>(7)?,
+                FileFlags(row.get(8)?),
+            ))
+        })?;
         let mut sources = Vec::new();
         for row in rows {
             let (kind, line, path, symbol, name, symbol_kind, container, symbol_line, flags) = row?;
@@ -330,11 +342,13 @@ impl Builder<'_> {
     /// never resolves to a definition in a test file.
     fn callees(&mut self, source: usize, definition: &Definition) -> Result<Vec<usize>> {
         let mut statement = self.opened.conn.prepare_cached(
-            "SELECT n.name, r.kind, r.line FROM refs r JOIN names n ON n.id = r.name_id
-             WHERE r.enclosing = ?1 AND r.kind = 'call' ORDER BY r.line, r.col",
+            "SELECT n.name, r.kind, r.line FROM symbols s
+             JOIN refs r ON r.blob_id = s.blob_id AND r.line BETWEEN s.start_line AND s.end_line
+             JOIN names n ON n.id = r.name_id
+             WHERE s.id = ?1 AND r.enclosing = ?1 AND r.kind = ?2 ORDER BY r.line, r.col",
         )?;
         let calls: Vec<(String, RefKind, u32)> = statement
-            .query_map(params![definition.id], |row| {
+            .query_map(params![definition.id, RefKind::Call], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
             .collect::<rusqlite::Result<_>>()?;

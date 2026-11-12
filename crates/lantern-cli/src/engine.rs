@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorKind, Result};
 use crate::home::{Home, default_home};
 use crate::limits::MAX_MAX_FILE_SIZE;
 use crate::paths;
@@ -16,10 +16,10 @@ use crate::query::outline::Outline;
 use crate::query::refs::{RefHit, RefsQuery};
 use crate::query::symbols::{SymbolQuery, SymbolsFound};
 use crate::query::{self, Freshness, Opened, Page, PageRequest};
-use crate::refresh::{self, Mode, RefreshCounts, Settings};
+use crate::refresh::{self, Mode, RefreshCounts, Settings, Target};
 use crate::source::SourceKind;
-use crate::store::remove_database;
 use crate::store::shard::{self, Counts};
+use crate::store::{is_newer, remove_database, schema_version};
 use crate::workspace::{self, Resolved};
 
 /// Settings that every command shares.
@@ -93,10 +93,12 @@ impl Lantern {
         })
     }
 
-    /// Refreshes the root at `path` and reports its totals.
-    pub fn index(&self, path: &Path, mode: Mode) -> Result<IndexReport> {
+    /// Refreshes the root at `path` and reports its totals. `force` allows the first index of
+    /// the home folder or a drive root.
+    pub fn index(&self, path: &Path, mode: Mode, force: bool) -> Result<IndexReport> {
         let started = Instant::now();
         let target = workspace::resolve(path, &self.home)?.target;
+        self.refuse_first_index(&target, false, force)?;
         let refreshed = refresh::refresh(&self.home, &target, &self.settings, mode)?;
         // Only `index` reports this; a query must not fail because another query was reading.
         if refreshed.checkpoint_pending {
@@ -162,15 +164,27 @@ impl Lantern {
         let mut report = PruneReport::default();
         for (hash, files) in files_of {
             // A refresh holds this lock, so its root exists and its files are in use.
-            let Ok(_lock) = self.home.lock_hash(&hash, Some(Duration::ZERO)) else {
-                continue;
+            let _lock = match self.home.lock_hash(&hash, Some(Duration::ZERO)) {
+                Ok(lock) => lock,
+                Err(error) if error.kind() == ErrorKind::Temporary => continue,
+                Err(error) => return Err(error),
             };
             let shard_path = roots_dir.join(format!("{hash}.sqlite"));
-            let root = shard::open_existing(&shard_path)?
-                .map(|conn| shard::meta(&conn))
-                .transpose()?
-                .flatten()
-                .map(|meta| meta.root);
+            let newer = match is_newer(&shard_path) {
+                Err(error) if error.kind() == ErrorKind::Damaged => false,
+                newer => newer?,
+            };
+            if newer {
+                continue;
+            }
+            let root = match shard::stored_meta(&shard_path) {
+                // An unreadable shard is a cache that cannot be used; its root needs a new index.
+                Err(error) if error.kind() == ErrorKind::Damaged => {
+                    report.removed_files += 1;
+                    None
+                }
+                meta => meta?.map(|meta| meta.root),
+            };
             let live = root.as_ref().is_some_and(|root| Path::new(root).is_dir());
             if !live {
                 remove_database(&shard_path)?;
@@ -188,10 +202,34 @@ impl Lantern {
         Ok(report)
     }
 
+    /// Only a Git repository is indexed for the first time by a query. A plain folder needs
+    /// `lantern index`, and a broad root also needs `--force`, so an agent that started in the
+    /// wrong folder does not index a whole disk.
+    fn refuse_first_index(&self, target: &Target, by_query: bool, force: bool) -> Result<()> {
+        if was_indexed(&self.home.shard_path(&target.root_key))? {
+            return Ok(());
+        }
+        let root = target.root.display();
+        let broad = workspace::is_broad_root(&target.root);
+        if broad && !force {
+            return Err(Error::usage(format!(
+                "{root} is the home folder, holds it, or is a drive root, so Lantern does not index it: that can take long and use much disk. Run the command inside a project folder. Index this folder only if the user asked for it: lantern index \"{root}\" --force"
+            )));
+        }
+        let plain_folder = target.source == SourceKind::Folder;
+        if by_query && plain_folder {
+            return Err(Error::usage(format!(
+                "{root} is not in a Git repository and has no index; Lantern indexes a plain folder only on request. If the user asked to search this folder, run: lantern index \"{root}\". Otherwise ask the user first, or run the command inside a Git repository"
+            )));
+        }
+        Ok(())
+    }
+
     /// Resolves the root at `cwd`, refreshes it unless `freshness` is stale, and opens it.
     fn open_root(&self, cwd: &Path, freshness: Freshness) -> Result<(Opened, Resolved)> {
         let resolved = workspace::resolve(cwd, &self.home)?;
         if freshness == Freshness::Walk {
+            self.refuse_first_index(&resolved.target, true, false)?;
             refresh::refresh(
                 &self.home,
                 &resolved.target,
@@ -271,8 +309,11 @@ impl Lantern {
     ) -> Result<Outline> {
         let (opened, resolved) = self.open_root(cwd, freshness)?;
         let mut outline = if Path::new(file).is_absolute() {
-            let absolute = paths::canonical(Path::new(file))
-                .map_err(|_| Error::usage(format!("{file} does not exist")))?;
+            let absolute =
+                paths::canonical(Path::new(file)).map_err(|error| match error.kind() {
+                    std::io::ErrorKind::NotFound => Error::usage(format!("{file} does not exist")),
+                    _ => Error::io(Path::new(file), &error),
+                })?;
             let relative = paths::relative(&resolved.target.root, &absolute)
                 .ok_or_else(|| Error::usage(format!("{file} is outside the workspace")))?;
             query::outline::run(&opened, "", &relative, page)?
@@ -282,6 +323,25 @@ impl Lantern {
         rebase(&resolved.scope, std::iter::once(&mut outline.path));
         Ok(outline)
     }
+}
+
+/// A failed first index leaves a shard without `indexed_at`; an older schema was indexed once.
+fn was_indexed(path: &Path) -> Result<bool> {
+    match read_was_indexed(path) {
+        // Only a written file can be damaged; `index --rebuild` replaces it.
+        Err(error) if error.kind() == ErrorKind::Damaged => Ok(true),
+        indexed => indexed,
+    }
+}
+
+fn read_was_indexed(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let Some(conn) = shard::open_existing(path)? else {
+        return Ok(schema_version(path)? > 0);
+    };
+    Ok(shard::meta(&conn)?.is_some_and(|meta| meta.indexed_at.is_some()))
 }
 
 /// True for the shard itself and its WAL and shared-memory files.

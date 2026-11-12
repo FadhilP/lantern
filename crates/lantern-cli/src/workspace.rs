@@ -76,6 +76,17 @@ fn containing_repository(root: &Path) -> Result<Option<&Path>> {
     Ok(source::is_gitlink(parent, &gitlink)?.then_some(parent))
 }
 
+/// The home folder, a folder that holds it, or a filesystem or drive root. A first index there is
+/// most often an accident: an agent started in the wrong folder.
+pub(crate) fn is_broad_root(root: &Path) -> bool {
+    if root.parent().is_none() {
+        return true;
+    }
+    std::env::home_dir()
+        .and_then(|home| paths::canonical(&home).ok())
+        .is_some_and(|home| home.starts_with(root))
+}
+
 fn target(root: PathBuf, source: SourceKind) -> Target {
     Target {
         root_key: paths::root_key(&root),
@@ -85,8 +96,9 @@ fn target(root: PathBuf, source: SourceKind) -> Target {
 }
 
 fn indexed_as_folder(home: &Home, dir: &Path) -> Result<bool> {
-    let Some(conn) = shard::open_existing(&home.shard_path(&paths::root_key(dir)))? else {
-        return Ok(false);
-    };
-    Ok(shard::meta(&conn)?.is_some_and(|meta| meta.source == SourceKind::Folder))
+    match shard::stored_meta(&home.shard_path(&paths::root_key(dir))) {
+        // A shard SQLite cannot read proves no folder index.
+        Err(error) if error.kind() == ErrorKind::Damaged => Ok(false),
+        meta => Ok(meta?.is_some_and(|meta| meta.source == SourceKind::Folder)),
+    }
 }

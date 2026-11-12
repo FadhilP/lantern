@@ -38,3 +38,17 @@
 
 (member_call_expression
   name: (name) @name) @reference.call
+
+; constants: const declarations (top level and class), define(), and enum cases
+
+(const_declaration (const_element (name) @name) @definition.constant)
+
+((function_call_expression
+  function: (name) @_function
+  arguments: (arguments . (argument (string (string_content) @name)))) @definition.constant
+  (#eq? @_function "define"))
+
+(enum_case name: (name) @name) @definition.constant
+
+; base classes
+(base_clause [(name) @name (qualified_name (name) @name)]) @reference.implementation

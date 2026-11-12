@@ -32,14 +32,14 @@ A **shard** holds one root: a Git working tree with its checked-out submodules, 
 
 - `files`: every eligible path with its identity (device and inode), size, modification and change times, flags, and blob. The times stay in the platform's unit.
 - `blobs`: zstd-compressed content. The key hashes the detected language and the bytes, so identical files share one blob and a move reuses it.
-- `blobs_fts`: a contentless FTS5 trigram index over blob text, for `code` candidates.
+- `trigrams`: Lantern's own trigram index over blob text, for `code` candidates. A row holds the postings of one trigram for a block of 256 blob ids: each posting has the blob, how often the trigram occurs, and a one-byte filter of the characters that follow it. Text is case-folded as the regex engine folds it, so a case-insensitive match is never missed. New blobs take the free ids below the largest one first, so blocks stay full.
 - `names` and `names_fts`: interned identifiers, with initials for `symbols`.
-- `symbols` and `refs`: tree-sitter definitions and references per blob. A reference records its innermost enclosing definition.
+- `symbols` and `refs`: tree-sitter definitions and references per blob, with kinds stored as numbers. A reference records its innermost enclosing definition. `refs` is keyed by blob and position, so the table itself serves a file's references and a definition's line range. A signature is not stored; queries take the definition's line from the blob text.
 - `meta`: root, source, Git head, policy token, extractor version, generation, and the start time of the last committed scan.
 
 The files of a checked-out submodule are stored in the shard of the repository that contains it, under the submodule's path. A start directory inside a submodule resolves to that outer repository, so the submodule has no shard of its own.
 
-A shard written by an older schema version is deleted and built again at the next refresh.
+A shard written by an older schema version is deleted and built again at the next refresh. A shard file that SQLite cannot read fails each command with a hint to run `lantern index --rebuild`, which replaces the file; `prune` deletes it.
 
 ## Refresh
 
@@ -47,12 +47,12 @@ A query first refreshes the shard of its root, unless `--stale-ok` is set.
 
 1. **Inventory.** The Git source reads the index, then lists the working tree one directory level at a time with a pool of 4 threads (more threads only contend on Windows). It enters directories that hold tracked paths, and untracked directories that Git's excludes keep and that are not repositories of their own. It keeps tracked files and the untracked files that the excludes keep. On Windows the directory listing carries each file's metadata, so files are not opened. Like Git's `core.fscache`, this trusts NTFS directory entries, which can lag behind a file that is open for writing or a hard link changed under another name. The source then does the same for each checked-out gitlink and adds its paths under the gitlink's prefix. A repository's `.lanternignore` files apply to its own paths; a parent rule that matches the gitlink path removes the submodule. The folder source walks the tree in parallel with scoped `.gitignore`, `.lanternignore`, and the defaults. Both return the same list of paths with their metadata.
 2. **Diff.** A path is a candidate when it is new, when its stored metadata differs, or when its modification or change time is not at least 2 seconds older than the start of the last committed scan (Git's racy rule: such a file can change again and keep its metadata). A change to the rules, the source, or `--max-file-size` (the policy token) makes every path a candidate.
-3. **Prepare.** A rayon pool reads candidates with a stable read: the file's own metadata, taken again because a directory entry can lag, must match before the open, after the open, after the read, and after the close. It detects the language, parses with a time budget (1 s per MiB, at least 100 ms), and compresses the content.
-4. **Commit.** One writer thread takes the prepared results through a bounded channel. It writes everything in one SQLite transaction under the root's lock. It reads the inventory again before the commit; if a file changed, the attempt starts over, up to 3 times.
+3. **Prepare.** A rayon pool reads candidates with a stable read: the file's own metadata, taken again because a directory entry can lag, must match before the open, after the open, after the read, and after the close. A file that cannot be opened or read (for example access denied, or locked by another process) is stored with no content and a mark, so every refresh reads it again; running out of memory or file handles fails the refresh instead. A directory below the root that cannot be listed is skipped with its files. It detects the language, parses with a time budget (1 s per MiB, at least 100 ms), and compresses the content.
+4. **Commit.** One writer thread takes the prepared results through a bounded channel. It writes everything in one SQLite transaction under the root's lock. A new shard builds its secondary indexes after the load, in one sorted pass each. After the last read, a second thread reads the inventory again while the writer finishes. Files that changed in the meantime are read and written in the same transaction, up to 3 rounds; a change to the ignore rules starts the attempt over. A `--rebuild` writes its staging file with a memory journal and no sync, because a failure deletes that file. A killed rebuild cannot delete it, so every refresh deletes a staging file it finds under the lock.
 
 The generation of a shard goes up only when results change. Cursors carry the generation, so a page from a changed index fails with exit 4 instead of skipping or repeating rows.
 
-**Secure removal.** Shards run with `secure_delete`. A commit that removes paths or changes the policy also merges the FTS index, deletes unused names, and truncates the WAL. If a reader blocks the truncation, the next refresh tries again. A query still succeeds; only `index` exits 75.
+**Secure removal.** Shards run with SQLite `secure_delete`, so freed pages are zeroed. A commit that removes paths or changes the policy also removes the trigram postings of the deleted text, deletes unused names, and truncates the WAL. Postings are removed in place: the commit counts the trigrams of each deleted text again and rewrites the rows that hold them. If a reader blocks the truncation, the next refresh tries again. A query still succeeds; only `index` exits 75. Limit: SQLite does not clear the unused gap inside a page when it moves cells, so a few strings of removed text (a path or an identifier) can stay in those gaps. `lantern index --rebuild` writes a new file and removes them.
 
 **Upgrades.** When the extractor version changes (Lantern version, tag queries, or grammar shape), the next refresh re-extracts symbols from the stored blobs without reading the disk. It reads only files that the new binary assigns to a different language.
 
@@ -60,11 +60,11 @@ The generation of a shard goes up only when results change. Cursors carry the ge
 
 Each query opens the shard read-only in one read transaction. Every statement of a query therefore sees one commit, even while another process refreshes.
 
-- `symbols`: candidates from the trigram name index, a case-insensitive prefix range, and an initials range; ranked in Rust by match tier (exact, prefix, initials, substring), then word start, then name length. With `--body`, each file on the page is parsed again, because the shard stores a definition's name line but not the line where its decorators and doc comments start.
-- `code`: literals extracted from the pattern give an FTS candidate query; candidates are decompressed and matched line by line in parallel.
+- `symbols`: candidates from the trigram name index, a case-insensitive prefix range, and an initials range; ranked in Rust by match tier (exact, prefix, initials, substring), then word start, then name length. Each file on the page is decompressed once for the signatures, and with `--body` for the lines from the stored start line, where decorators and doc comments start.
+- `code`: literals extracted from the pattern select candidates from the trigram index; candidates are decompressed and matched line by line in parallel. A file scores `n / (n + 1)` for each distinct literal it holds `n` times, so each repeat adds less than the one before. The index gives each candidate an upper bound of that score; candidates are checked in bound order, and a file goes on the page once no unchecked candidate can rank before it.
 - `refs`: an exact name lookup with the enclosing definition.
 - `graph`: a breadth-first expansion over calls, resolved by name.
-- `outline`: one file's symbols, nested by line range.
+- `outline`: one file's symbols, nested by line range and by container.
 
 ## Platform notes
 

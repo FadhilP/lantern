@@ -1,15 +1,19 @@
 //! One shard per root: blobs, trigram index, names, symbols, references, files.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
 use std::path::Path;
 
+use rayon::prelude::*;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
 use crate::extract::Extraction;
 use crate::fsmeta::{EntryKind, Stat};
+use crate::language::FileFlags;
 use crate::source::SourceKind;
+use crate::store::trigram::{Pending, Trigrams};
 
 const SCHEMA: &str = r"
 CREATE TABLE meta (
@@ -31,17 +35,18 @@ CREATE TABLE blobs (
   -- Parse timeouts in a row; a timed-out blob is parsed again on later refreshes.
   timeouts INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX blobs_timeouts ON blobs(timeouts) WHERE timeouts > 0;
-CREATE VIRTUAL TABLE blobs_fts USING fts5(
-  content, content='', contentless_delete=1, tokenize='trigram'
-);
+-- The postings of one trigram for a block of blob ids; see `store::trigram`.
+CREATE TABLE trigrams (
+  block INTEGER NOT NULL,
+  trigram INTEGER NOT NULL,
+  postings BLOB NOT NULL,
+  PRIMARY KEY (block, trigram)
+) WITHOUT ROWID;
 CREATE TABLE names (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
   initials TEXT NOT NULL
 );
-CREATE INDEX names_nocase ON names(name COLLATE NOCASE);
-CREATE INDEX names_initials ON names(initials);
 CREATE VIRTUAL TABLE names_fts USING fts5(
   name, content='names', content_rowid='id', tokenize='trigram'
 );
@@ -49,23 +54,22 @@ CREATE TABLE symbols (
   id INTEGER PRIMARY KEY,
   blob_id INTEGER NOT NULL REFERENCES blobs ON DELETE CASCADE,
   name_id INTEGER NOT NULL REFERENCES names,
-  kind TEXT NOT NULL,
+  kind INTEGER NOT NULL,
   container TEXT,
   line INTEGER NOT NULL, col INTEGER NOT NULL, end_line INTEGER NOT NULL,
-  signature TEXT NOT NULL
+  -- The first line of the decorators, attributes, and doc comments before the definition.
+  start_line INTEGER NOT NULL
 );
-CREATE INDEX symbols_name ON symbols(name_id);
-CREATE INDEX symbols_blob ON symbols(blob_id, line);
+-- Keyed by position, so the table itself serves a file's refs and a definition's line range.
 CREATE TABLE refs (
   blob_id INTEGER NOT NULL REFERENCES blobs ON DELETE CASCADE,
-  name_id INTEGER NOT NULL REFERENCES names,
-  kind TEXT NOT NULL,
   line INTEGER NOT NULL, col INTEGER NOT NULL,
-  enclosing INTEGER REFERENCES symbols(id) ON DELETE CASCADE
-);
-CREATE INDEX refs_name ON refs(name_id);
-CREATE INDEX refs_blob ON refs(blob_id, line);
-CREATE INDEX refs_enclosing ON refs(enclosing);
+  name_id INTEGER NOT NULL REFERENCES names,
+  kind INTEGER NOT NULL,
+  -- A symbol of the same blob, deleted with it; a foreign key would need an index of its own.
+  enclosing INTEGER,
+  PRIMARY KEY (blob_id, line, col, name_id, kind)
+) WITHOUT ROWID;
 -- blob_id is NULL for binary and oversized files, so they are not reread on every refresh.
 CREATE TABLE files (
   path TEXT PRIMARY KEY,
@@ -75,14 +79,34 @@ CREATE TABLE files (
   -- In the platform's unit; see `fsmeta::Stat`.
   modified INTEGER NOT NULL, changed INTEGER NOT NULL
 ) WITHOUT ROWID;
-CREATE INDEX files_blob ON files(blob_id);
+";
+
+/// A new shard builds these after its first load: one sorted build is faster than a row at a time.
+const INDEXES: &str = r"
+CREATE INDEX IF NOT EXISTS blobs_timeouts ON blobs(timeouts) WHERE timeouts > 0;
+-- A blobs row shares its page with the content; `code --language` reads this instead.
+CREATE INDEX IF NOT EXISTS blobs_language ON blobs(language);
+CREATE INDEX IF NOT EXISTS names_nocase ON names(name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS names_initials ON names(initials);
+CREATE INDEX IF NOT EXISTS symbols_name ON symbols(name_id);
+CREATE INDEX IF NOT EXISTS symbols_blob ON symbols(blob_id, line);
+CREATE INDEX IF NOT EXISTS refs_name ON refs(name_id);
+CREATE INDEX IF NOT EXISTS files_blob ON files(blob_id);
 ";
 
 pub(crate) fn open(path: &Path) -> Result<Connection> {
     let conn = super::open(path, SCHEMA)?;
-    // Freed pages are zeroed, so edited and removed content does not stay readable in them.
-    conn.execute_batch("PRAGMA secure_delete = ON")?;
+    // Freed cells and pages are zeroed; stale copies in page gaps stay until a rebuild.
+    // The writer touches index pages at random; with the 2 MB default cache it rereads them.
+    conn.execute_batch(
+        "PRAGMA secure_delete = ON; PRAGMA cache_size = -65536; PRAGMA threads = 4",
+    )?;
     Ok(conn)
+}
+
+pub(crate) fn create_indexes(conn: &Connection) -> Result<()> {
+    conn.execute_batch(INDEXES)?;
+    Ok(())
 }
 
 /// Opens an existing shard read-only; `None` when this Lantern never indexed the root.
@@ -91,6 +115,14 @@ pub(crate) fn open_existing(path: &Path) -> Result<Option<Connection>> {
         return Ok(None);
     }
     super::open_read_only(path)
+}
+
+/// The meta of an existing shard; `None` when it has no committed schema or meta yet.
+pub(crate) fn stored_meta(path: &Path) -> Result<Option<Meta>> {
+    let Some(conn) = open_existing(path)? else {
+        return Ok(None);
+    };
+    meta(&conn)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,24 +274,42 @@ pub(crate) fn delete_file(conn: &Connection, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Deletes every blob in `candidates` that no file references. Returns how many it deleted.
 pub(crate) fn delete_orphans(
     conn: &Connection,
+    trigrams: &mut Pending,
     candidates: impl IntoIterator<Item = i64>,
 ) -> Result<usize> {
     let mut used = conn.prepare_cached("SELECT 1 FROM files WHERE blob_id = ?1 LIMIT 1")?;
-    let mut fts = conn.prepare_cached("DELETE FROM blobs_fts WHERE rowid = ?1")?;
-    let mut blob = conn.prepare_cached("DELETE FROM blobs WHERE id = ?1")?;
-    let mut deleted = 0;
+    let mut orphans = BTreeSet::new();
     for id in candidates {
-        if used.exists([id])? {
-            continue;
+        if !used.exists([id])? {
+            orphans.insert(id);
         }
-        fts.execute([id])?;
-        deleted += blob.execute([id])?;
     }
-    Ok(deleted)
+    let orphans: Vec<i64> = orphans.into_iter().collect();
+    let mut content = conn.prepare_cached("SELECT content FROM blobs WHERE id = ?1")?;
+    let mut blob = conn.prepare_cached("DELETE FROM blobs WHERE id = ?1")?;
+    for batch in orphans.chunks(ORPHAN_BATCH) {
+        let compressed: Vec<Vec<u8>> = batch
+            .iter()
+            .map(|&id| content.query_row([id], |row| row.get(0)))
+            .collect::<rusqlite::Result<_>>()?;
+        let counted: Vec<Trigrams> = compressed
+            .par_iter()
+            .map(|bytes| Ok(Trigrams::of(&decompress(bytes)?)))
+            .collect::<Result<_>>()?;
+        for (&id, counted) in batch.iter().zip(&counted) {
+            trigrams.remove(conn, id, counted)?;
+            // Not left to the cascade: a new shard writes with foreign keys off.
+            delete_extraction(conn, id)?;
+            blob.execute([id])?;
+        }
+    }
+    Ok(orphans.len())
 }
+
+/// Bounds the memory of a large removal.
+const ORPHAN_BATCH: usize = 256;
 
 /// Deletes names that no symbol or reference uses, so removed identifiers do not stay readable.
 pub(crate) fn delete_unused_names(conn: &Connection) -> Result<()> {
@@ -277,31 +327,70 @@ pub(crate) fn delete_unused_names(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// A blob ready to insert: compressed content plus its extraction.
 #[derive(Debug)]
 pub(crate) struct NewBlob {
     pub key: BlobKey,
     pub language: Option<&'static str>,
     pub lines: i64,
     pub compressed: Vec<u8>,
-    pub text: String,
+    pub trigrams: Trigrams,
     pub extraction: Extraction,
 }
 
-pub(crate) fn insert_blob(conn: &Connection, names: &mut Names, blob: &NewBlob) -> Result<i64> {
+/// Gaps first, so trigram blocks stay full.
+#[derive(Debug)]
+pub(crate) struct BlobIds {
+    /// Descending, so the smallest gap is last.
+    gaps: Vec<i64>,
+    next: i64,
+}
+
+impl BlobIds {
+    pub(crate) fn load(conn: &Connection) -> Result<Self> {
+        let mut ids: Vec<i64> = conn
+            .prepare("SELECT id FROM blobs")?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        ids.sort_unstable();
+        let mut gaps = Vec::new();
+        let mut next = 1;
+        for id in ids {
+            gaps.extend(next..id);
+            next = id + 1;
+        }
+        gaps.reverse();
+        Ok(Self { gaps, next })
+    }
+
+    fn take(&mut self) -> i64 {
+        self.gaps.pop().unwrap_or_else(|| {
+            self.next += 1;
+            self.next - 1
+        })
+    }
+}
+
+pub(crate) fn insert_blob(
+    conn: &Connection,
+    ids: &mut BlobIds,
+    names: &mut Names,
+    trigrams: &mut Pending,
+    blob: &NewBlob,
+) -> Result<i64> {
+    let id = ids.take();
     conn.prepare_cached(
-        "INSERT INTO blobs (key, language, lines, content, timeouts) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO blobs (id, key, language, lines, content, timeouts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?
     .execute(params![
+        id,
         blob.key.as_slice(),
         blob.language,
         blob.lines,
         blob.compressed,
         blob.extraction.timed_out
     ])?;
-    let id = conn.last_insert_rowid();
-    conn.prepare_cached("INSERT INTO blobs_fts (rowid, content) VALUES (?1, ?2)")?
-        .execute(params![id, blob.text])?;
+    trigrams.add(conn, id, &blob.trigrams)?;
     insert_extraction(conn, names, id, &blob.extraction)?;
     Ok(id)
 }
@@ -316,18 +405,19 @@ pub(crate) fn insert_extraction(
     for symbol in &extraction.symbols {
         let name_id = names.id(conn, &symbol.name)?;
         conn.prepare_cached(
-            "INSERT INTO symbols (blob_id, name_id, kind, container, line, col, end_line, signature)
+            "INSERT INTO symbols
+               (blob_id, name_id, kind, container, line, col, end_line, start_line)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?
         .execute(params![
             blob_id,
             name_id,
-            symbol.kind.as_str(),
+            symbol.kind,
             symbol.container,
             symbol.line,
             symbol.col,
             symbol.end_line,
-            symbol.signature
+            symbol.start_line
         ])?;
         symbol_ids.push(conn.last_insert_rowid());
     }
@@ -335,14 +425,16 @@ pub(crate) fn insert_extraction(
         let name_id = names.id(conn, &reference.name)?;
         let enclosing = reference.enclosing.map(|index| symbol_ids[index]);
         conn.prepare_cached(
-            "INSERT INTO refs (blob_id, name_id, kind, line, col, enclosing) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            // Two refs at one position with one name and kind say nothing more than one.
+            "INSERT OR IGNORE INTO refs (blob_id, line, col, name_id, kind, enclosing)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?
         .execute(params![
             blob_id,
-            name_id,
-            reference.kind.as_str(),
             reference.line,
             reference.col,
+            name_id,
+            reference.kind,
             enclosing
         ])?;
     }
@@ -390,11 +482,23 @@ pub(crate) fn blob_text(conn: &Connection, blob_id: i64) -> Result<String> {
 }
 
 pub(crate) fn decompress(compressed: &[u8]) -> Result<String> {
+    thread_local! {
+        // Creating a context costs more than decoding a typical file.
+        static CONTEXT: RefCell<zstd::zstd_safe::DCtx<'static>> =
+            RefCell::new(zstd::zstd_safe::DCtx::create());
+    }
     let mut bytes = Vec::new();
-    zstd::stream::read::Decoder::new(compressed)
-        .and_then(|mut decoder| decoder.read_to_end(&mut bytes))
-        .map_err(|error| Error::failure(format!("corrupt blob: {error}")))?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    CONTEXT
+        .with_borrow_mut(|context| {
+            zstd::stream::read::Decoder::with_context(compressed, context).read_to_end(&mut bytes)
+        })
+        .map_err(|error| {
+            Error::failure(format!(
+                "corrupt blob: {error}; run `lantern index --rebuild`"
+            ))
+        })?;
+    Ok(String::from_utf8(bytes)
+        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()))
 }
 
 /// Row counts for `index` and `status` output.
@@ -407,6 +511,8 @@ pub struct Counts {
     pub refs: u64,
     /// Files with no symbols because their last parse ran out of time.
     pub unparsed_files: u64,
+    /// Files with no content because the last refresh could not open or read them.
+    pub unreadable_files: u64,
 }
 
 impl std::ops::AddAssign for Counts {
@@ -417,6 +523,7 @@ impl std::ops::AddAssign for Counts {
         self.symbols += other.symbols;
         self.refs += other.refs;
         self.unparsed_files += other.unparsed_files;
+        self.unreadable_files += other.unreadable_files;
     }
 }
 
@@ -427,8 +534,9 @@ pub(crate) fn counts(conn: &Connection) -> Result<Counts> {
                 (SELECT count(*) FROM files f JOIN blobs b ON b.id = f.blob_id WHERE b.language IS NOT NULL),
                 (SELECT count(*) FROM symbols),
                 (SELECT count(*) FROM refs),
-                (SELECT count(*) FROM files f JOIN blobs b ON b.id = f.blob_id WHERE b.timeouts > 0)",
-        [],
+                (SELECT count(*) FROM files f JOIN blobs b ON b.id = f.blob_id WHERE b.timeouts > 0),
+                (SELECT count(*) FROM files WHERE flags & ?1)",
+        [FileFlags::UNREADABLE],
         |row| {
             Ok(Counts {
                 files: row.get::<_, i64>(0)?.unsigned_abs(),
@@ -437,19 +545,36 @@ pub(crate) fn counts(conn: &Connection) -> Result<Counts> {
                 symbols: row.get::<_, i64>(3)?.unsigned_abs(),
                 refs: row.get::<_, i64>(4)?.unsigned_abs(),
                 unparsed_files: row.get::<_, i64>(5)?.unsigned_abs(),
+                unreadable_files: row.get::<_, i64>(6)?.unsigned_abs(),
             })
         },
     )?)
 }
 
-/// Files with no symbols because their last parse ran out of time.
-pub(crate) fn unparsed_files(conn: &Connection) -> Result<u64> {
-    let count: i64 = conn.query_row(
-        "SELECT count(*) FROM files f JOIN blobs b ON b.id = f.blob_id WHERE b.timeouts > 0",
-        [],
-        |row| row.get(0),
-    )?;
-    Ok(count.unsigned_abs())
+/// Why an empty result may be empty.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Incomplete {
+    /// Files with no symbols because their last parse ran out of time.
+    pub unparsed_files: u64,
+    /// Files with no content because the last refresh could not open or read them.
+    pub unreadable_files: u64,
+    /// `--path` was given and no indexed file in scope passes it.
+    pub no_file_in_path: bool,
+}
+
+pub(crate) fn incomplete(conn: &Connection) -> Result<Incomplete> {
+    Ok(conn.query_row(
+        "SELECT (SELECT count(*) FROM files f JOIN blobs b ON b.id = f.blob_id WHERE b.timeouts > 0),
+                (SELECT count(*) FROM files WHERE flags & ?1)",
+        [FileFlags::UNREADABLE],
+        |row| {
+            Ok(Incomplete {
+                unparsed_files: row.get::<_, i64>(0)?.unsigned_abs(),
+                unreadable_files: row.get::<_, i64>(1)?.unsigned_abs(),
+                no_file_in_path: false,
+            })
+        },
+    )?)
 }
 
 /// Interned identifiers. A secure refresh deletes unused ones.
@@ -467,16 +592,15 @@ impl Names {
             .prepare_cached("SELECT id FROM names WHERE name = ?1")?
             .query_row([name], |row| row.get(0))
             .optional()?;
-        let id = match existing {
-            Some(id) => id,
-            None => {
-                conn.prepare_cached("INSERT INTO names (name, initials) VALUES (?1, ?2)")?
-                    .execute(params![name, initials(name)])?;
-                let id = conn.last_insert_rowid();
-                conn.prepare_cached("INSERT INTO names_fts (rowid, name) VALUES (?1, ?2)")?
-                    .execute(params![id, name])?;
-                id
-            }
+        let id = if let Some(id) = existing {
+            id
+        } else {
+            conn.prepare_cached("INSERT INTO names (name, initials) VALUES (?1, ?2)")?
+                .execute(params![name, initials(name)])?;
+            let id = conn.last_insert_rowid();
+            conn.prepare_cached("INSERT INTO names_fts (rowid, name) VALUES (?1, ?2)")?
+                .execute(params![id, name])?;
+            id
         };
         self.ids.insert(name.to_owned(), id);
         Ok(id)
@@ -512,7 +636,48 @@ pub(crate) fn initials(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::initials;
+    use super::*;
+
+    #[test]
+    fn an_orphan_loses_its_extraction_with_foreign_keys_off() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conn = open(&dir.path().join("shard.sqlite")).expect("open shard");
+        conn.pragma_update(None, "foreign_keys", false)
+            .expect("foreign keys off");
+        let content = zstd::encode_all(
+            "x
+"
+            .as_bytes(),
+            3,
+        )
+        .expect("compress");
+        conn.execute(
+            "INSERT INTO blobs (id, key, lines, content) VALUES (1, x'01', 1, ?1)",
+            [content],
+        )
+        .expect("insert blob");
+        conn.execute_batch(
+            "INSERT INTO names VALUES (1, 'f', 'f');
+             INSERT INTO symbols (blob_id, name_id, kind, line, col, end_line, start_line)
+               VALUES (1, 1, 0, 1, 0, 1, 1);
+             INSERT INTO refs VALUES (1, 1, 0, 1, 0, NULL);",
+        )
+        .expect("insert extraction");
+        let mut trigrams = Pending::new(&conn).expect("pending");
+        assert_eq!(
+            delete_orphans(&conn, &mut trigrams, [1]).expect("delete"),
+            1
+        );
+        trigrams.finish(&conn).expect("finish");
+        let left: i64 = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM symbols) + (SELECT count(*) FROM refs)",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(left, 0);
+    }
 
     #[test]
     fn initials_follow_word_boundaries() {

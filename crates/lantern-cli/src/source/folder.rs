@@ -7,7 +7,7 @@ use std::sync::{Mutex, mpsc};
 use ignore::{WalkBuilder, WalkState};
 
 use super::{DirRules, GITATTRIBUTES, Inventory, LANTERNIGNORE, Scan, classify, read_rule_file};
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorKind, Result};
 use crate::fsmeta::{self, EntryKind, Stat};
 use crate::limits::{self, MAX_DEPTH};
 use crate::paths;
@@ -52,16 +52,16 @@ pub(super) fn inventory(scan: &Scan<'_>) -> Result<Inventory> {
         let sender = sender.clone();
         let (failure, entries, rule_bytes) = (&failure, &entries, &rule_bytes);
         Box::new(move |result| {
-            let visited = visit(scan, result, &sender, rule_bytes).and_then(|()| {
+            let visited = visit(scan, result, &sender, rule_bytes).and_then(|state| {
                 if entries.fetch_add(1, Ordering::Relaxed) >= max_entries {
                     return Err(Error::failure(format!(
                         "folder has more than {max_entries} entries"
                     )));
                 }
-                scan.check_deadline()
+                scan.check_deadline().map(|()| state)
             });
             match visited {
-                Ok(()) => WalkState::Continue,
+                Ok(state) => state,
                 Err(error) => {
                     failure
                         .lock()
@@ -104,17 +104,24 @@ fn visit(
     result: Result<ignore::DirEntry, ignore::Error>,
     sender: &mpsc::Sender<Found>,
     rule_bytes: &AtomicU64,
-) -> Result<()> {
-    let entry = result.map_err(|error| Error::failure(format!("walk failed: {error}")))?;
+) -> Result<WalkState> {
+    // Git also skips a directory it cannot list; a root it cannot list fails.
+    let entry = match result {
+        Ok(entry) => entry,
+        Err(error) if is_permission_denied(&error) && error.depth() != Some(0) => {
+            return Ok(WalkState::Continue);
+        }
+        Err(error) => return Err(Error::failure(format!("walk failed: {error}"))),
+    };
     if let Some(error) = entry.error() {
         return Err(Error::failure(format!("ignore rules: {error}")));
     }
     let Some(file_type) = entry.file_type() else {
-        return Ok(());
+        return Ok(WalkState::Continue);
     };
     // Paths are stored as UTF-8; the Git source skips such paths too.
     let Some(relative) = paths::relative(scan.root, entry.path()) else {
-        return Ok(());
+        return Ok(WalkState::Continue);
     };
     if file_type.is_dir() {
         if entry.depth() >= MAX_DEPTH {
@@ -122,10 +129,17 @@ fn visit(
                 "directory depth exceeds {MAX_DEPTH}: {relative}"
             )));
         }
-        return read_dir_rules(entry.path(), &relative, sender, rule_bytes);
+        // Without search permission even a missing rule file is denied, so the directory is
+        // skipped before its files could escape its rules.
+        return match read_dir_rules(entry.path(), &relative, sender, rule_bytes) {
+            Err(error) if error.kind() == ErrorKind::Denied && entry.depth() > 0 => {
+                Ok(WalkState::Skip)
+            }
+            rules => rules.map(|()| WalkState::Continue),
+        };
     }
     if !file_type.is_file() {
-        return Ok(());
+        return Ok(WalkState::Continue);
     }
     let stat = match fsmeta::lstat(entry.path()) {
         Ok(stat) => stat,
@@ -134,12 +148,19 @@ fn visit(
                 "{relative} vanished during the walk"
             )));
         }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Stat::denied_file(),
         Err(error) => return Err(Error::io(entry.path(), &error)),
     };
     if stat.kind == EntryKind::File {
         let _ = sender.send(Found::File(relative, stat));
     }
-    Ok(())
+    Ok(WalkState::Continue)
+}
+
+fn is_permission_denied(error: &ignore::Error) -> bool {
+    error
+        .io_error()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
 }
 
 fn read_dir_rules(

@@ -1,6 +1,6 @@
 //! Git source: inventory parity with Git, failure on an unreadable index, branches, and attributes.
 
-use crate::common::{Fixture, count, files_with, names, paths, strings};
+use crate::common::{Fixture, count, deny_dir, files_with, names, paths, strings};
 
 #[test]
 fn inventory_equals_git_ls_files() {
@@ -134,4 +134,27 @@ fn generated_files_leave_symbols_and_rank_last_in_code() {
     assert_eq!(order[0], "src/app.ts", "{order:?}");
     assert_eq!(order.len(), 3);
     assert!(names(&f.ok(&["symbols", "shared", "--path", "gen/**"])).is_empty());
+}
+
+#[test]
+fn a_denied_directory_is_skipped_and_its_tracked_files_are_counted() {
+    let f = Fixture::new();
+    f.git("", &["init", "-q"]);
+    f.write("a.ts", "export function alpha() {}\n");
+    f.write("tracked/t.ts", "export function inside() {}\n");
+    f.write("untracked/.gitignore", "*.log\n");
+    f.write("untracked/u.ts", "export function hidden() {}\n");
+    f.git("", &["add", "a.ts", "tracked/t.ts"]);
+    f.git("", &["commit", "-qm", "init"]);
+    f.ok(&["index"]);
+    let Some(tracked) = deny_dir(&f.path("tracked")) else {
+        return;
+    };
+    let untracked = deny_dir(&f.path("untracked"));
+    f.write("b.ts", "export function beta() {}\n");
+    assert_eq!(names(&f.ok(&["symbols", "beta"])), strings(&["beta"]));
+    assert_eq!(count(&f.ok(&["status"]), "unreadable_files"), 1);
+    drop((tracked, untracked));
+    assert_eq!(names(&f.ok(&["symbols", "hidden"])), strings(&["hidden"]));
+    assert_eq!(count(&f.ok(&["status"]), "unreadable_files"), 0);
 }

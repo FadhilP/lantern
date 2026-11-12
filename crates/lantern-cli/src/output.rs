@@ -32,15 +32,20 @@ impl Printer {
         self.json
     }
 
+    /// Prints one text line, such as the `== QUERY` line above each page of a multi-query command.
+    pub fn heading(&self, text: &str) -> Result<(), Error> {
+        emit(text)
+    }
+
     /// Prints a report as one document; text output gets it indented.
-    pub fn document<T: Serialize>(&self, report: &T) {
+    pub fn document<T: Serialize>(&self, report: &T) -> Result<(), Error> {
         let mut document = to_value(report);
         document["schema"] = json!(SCHEMA);
         drop_nulls(&mut document);
         if self.json {
-            emit(&document.to_string());
+            emit(&document.to_string())
         } else {
-            emit(&serde_json::to_string_pretty(&document).unwrap_or_default());
+            emit(&serde_json::to_string_pretty(&document).unwrap_or_default())
         }
     }
 
@@ -68,7 +73,7 @@ impl Printer {
                 if let Some(cursor) = next_cursor {
                     lines.push(format!("-- more: --cursor {cursor}"));
                 }
-                return joined(lines, empty);
+                return joined(&lines, empty);
             }
             let mut document = json!({
                 "schema": SCHEMA,
@@ -89,8 +94,7 @@ impl Printer {
             drop_nulls(&mut document);
             document.to_string()
         };
-        emit(&fit(page.rows.len(), max_bytes, render)?);
-        Ok(())
+        emit(&fit(page.rows.len(), max_bytes, render)?)
     }
 
     /// Prints a graph; `max_bytes` drops the last nodes found, with their edges, until it fits.
@@ -102,7 +106,7 @@ impl Printer {
             kept.roots.retain(|&root| root < keep);
             kept.truncated |= keep < graph.nodes.len();
             if !self.json {
-                return joined(graph_lines(&kept), empty);
+                return joined(&graph_lines(&kept), empty);
             }
             let mut document = to_value(&kept);
             document["schema"] = json!(SCHEMA);
@@ -112,8 +116,7 @@ impl Printer {
             drop_nulls(&mut document);
             document.to_string()
         };
-        emit(&fit(graph.nodes.len(), max_bytes, render)?);
-        Ok(())
+        emit(&fit(graph.nodes.len(), max_bytes, render)?)
     }
 
     /// `unparsed_note` is empty, or the hint for files that ran out of parse time.
@@ -167,7 +170,10 @@ fn fit(
     if low == 0 && total > 0 {
         return Err(Error::new(
             ErrorKind::Usage,
-            format!("--max-bytes {max_bytes} is smaller than one result"),
+            format!(
+                "--max-bytes {max_bytes} is smaller than one result, which needs {} bytes",
+                render(1).len()
+            ),
         ));
     }
     Ok(render(low))
@@ -204,7 +210,9 @@ pub fn code_lines(hits: &[CodeHit]) -> Vec<String> {
     let mut lines = Vec::new();
     for hit in hits {
         let shown = hit.matches.len();
-        lines.push(if hit.match_count > shown {
+        lines.push(if shown == 0 {
+            format!("{} ({} matches)", hit.path, hit.match_count)
+        } else if hit.match_count > shown {
             format!("{} ({} matches, {shown} shown)", hit.path, hit.match_count)
         } else {
             hit.path.clone()
@@ -240,8 +248,9 @@ pub fn ref_lines(hits: &[RefHit]) -> Vec<String> {
             )
         });
         lines.push(format!(
-            "{} {}{site}: {}",
+            "{}:{} {}{site}: {}",
             hit.line,
+            hit.column,
             hit.kind.as_str(),
             hit.text
         ));
@@ -327,7 +336,7 @@ fn hint(empty: &str) -> Option<&str> {
 }
 
 /// `empty` is the text for no lines: `no results`, or that with a hint toward a better command.
-fn joined(lines: Vec<String>, empty: &str) -> String {
+fn joined(lines: &[String], empty: &str) -> String {
     if lines.is_empty() {
         return empty.to_owned();
     }
@@ -368,6 +377,11 @@ fn to_value<T: Serialize>(value: &T) -> Value {
 }
 
 /// Writes one line to stdout; a closed pipe ends the output quietly.
-fn emit(text: &str) {
-    let _ = writeln!(std::io::stdout().lock(), "{text}");
+fn emit(text: &str) -> Result<(), Error> {
+    match writeln!(std::io::stdout().lock(), "{text}") {
+        Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => {
+            Err(Error::failure(format!("stdout: {error}")))
+        }
+        _ => Ok(()),
+    }
 }

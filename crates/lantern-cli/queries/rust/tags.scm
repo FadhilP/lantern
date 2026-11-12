@@ -27,6 +27,14 @@
 (mod_item
     name: (identifier) @name) @definition.module
 
+; constants and statics, also associated constants in an impl or trait
+
+(const_item
+    name: (identifier) @name) @definition.constant
+
+(static_item
+    name: (identifier) @name) @definition.constant
+
 ; macro definitions
 
 (macro_definition

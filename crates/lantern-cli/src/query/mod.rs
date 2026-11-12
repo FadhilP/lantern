@@ -11,9 +11,10 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::error::{Error, ErrorKind, Result};
+use crate::extract::truncate_chars;
 use crate::home::Home;
 use crate::language::Language;
-use crate::limits::{MAX_LIMIT, MAX_QUERY_CHARS};
+use crate::limits::{MAX_LIMIT, MAX_QUERY_CHARS, MAX_SIGNATURE_CHARS};
 use crate::paths;
 use crate::store::shard;
 use crate::workspace::Resolved;
@@ -42,9 +43,8 @@ pub struct Page<T> {
     pub indexed_at: Option<i64>,
     pub rows: Vec<T>,
     pub next_cursor: Option<String>,
-    /// Files whose symbols are missing because parsing ran out of time; counted only for an
-    /// empty page.
-    pub unparsed_files: u64,
+    /// Counted only for an empty page.
+    pub incomplete: shard::Incomplete,
     cursor: CursorBase,
 }
 
@@ -68,6 +68,9 @@ impl CursorBase {
         format!("{offset}.{}.{}", self.query, self.state)
     }
 }
+
+const INVALID_CURSOR: &str =
+    "invalid cursor; pass the value after `-- more: --cursor` on the last page, unchanged";
 
 /// The shard of one root, open for one query.
 #[derive(Debug)]
@@ -119,9 +122,12 @@ impl Opened {
                 let (Some(offset), Some(for_query), Some(state)) =
                     (parts.next(), parts.next(), parts.next())
                 else {
-                    return Err(Error::usage("invalid cursor"));
+                    return Err(Error::usage(INVALID_CURSOR));
                 };
-                let offset: usize = offset.parse().map_err(|_| Error::usage("invalid cursor"))?;
+                let offset: usize = offset.parse().map_err(|_| Error::usage(INVALID_CURSOR))?;
+                if offset.checked_add(request.limit + 1).is_none() {
+                    return Err(Error::usage(INVALID_CURSOR));
+                }
                 if for_query != query {
                     return Err(Error::usage("the cursor belongs to a different query"));
                 }
@@ -141,51 +147,120 @@ impl Opened {
         })
     }
 
+    /// Why an empty result may be empty.
+    pub fn incomplete(&self, filter: &PathFilter) -> Result<shard::Incomplete> {
+        let mut incomplete = shard::incomplete(&self.conn)?;
+        incomplete.no_file_in_path = !filter.is_empty() && !self.any_file_passes(filter)?;
+        Ok(incomplete)
+    }
+
+    fn any_file_passes(&self, filter: &PathFilter) -> Result<bool> {
+        let mut statement = self.conn.prepare("SELECT path FROM files")?;
+        let paths = statement.query_map([], |row| row.get::<_, String>(0))?;
+        for path in paths {
+            if self.accept(&path?, filter) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Cuts one page from rows sorted in their final order.
-    pub fn page<T>(&self, query: &str, request: &PageRequest, rows: Vec<T>) -> Result<Page<T>> {
+    pub fn page<T>(
+        &self,
+        query: &str,
+        request: &PageRequest,
+        filter: &PathFilter,
+        rows: Vec<T>,
+    ) -> Result<Page<T>> {
         let cursor = self.start(query, request)?;
         let mut rows: Vec<T> = rows.into_iter().skip(cursor.offset).collect();
         let next_cursor =
             (rows.len() > request.limit).then(|| cursor.encode(cursor.offset + request.limit));
         rows.truncate(request.limit);
-        let unparsed_files = if rows.is_empty() {
-            shard::unparsed_files(&self.conn)?
+        let incomplete = if rows.is_empty() {
+            self.incomplete(filter)?
         } else {
-            0
+            shard::Incomplete::default()
         };
         Ok(Page {
             freshness: self.freshness,
             indexed_at: self.indexed_at,
             rows,
             next_cursor,
-            unparsed_files,
+            incomplete,
             cursor,
         })
     }
 
-    /// How many sorted rows a page needs: its offset, its rows, and one to detect more.
-    pub fn needed(&self, query: &str, request: &PageRequest) -> Result<usize> {
-        Ok(self.start(query, request)?.offset + request.limit + 1)
+    /// Which sorted rows a page needs.
+    pub fn needed(&self, query: &str, request: &PageRequest) -> Result<Needed> {
+        let offset = self.start(query, request)?.offset;
+        Ok(Needed {
+            offset,
+            rows: offset + request.limit + 1,
+        })
     }
 }
 
-/// The `--path` globs, resolved against the start directory; a path passes if any glob matches.
+/// The sorted rows a page needs: `rows` counts the skipped rows before `offset`, the page, and
+/// one row to detect more.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Needed {
+    pub offset: usize,
+    pub rows: usize,
+}
+
+/// The `--path` globs, resolved against the start directory. A path passes if any include glob
+/// matches (or there is none) and no `!` exclude glob matches.
 #[derive(Debug, Default)]
 pub(crate) struct PathFilter {
-    globs: Vec<GlobMatcher>,
+    includes: Vec<GlobMatcher>,
+    excludes: Vec<GlobMatcher>,
 }
 
 impl PathFilter {
     pub fn new(globs: &[String], cwd_scope: &str) -> Result<Self> {
-        let globs = globs
-            .iter()
-            .map(|glob| compile_path_glob(glob, cwd_scope))
-            .collect::<Result<_>>()?;
-        Ok(Self { globs })
+        let mut filter = Self::default();
+        for glob in globs {
+            let (list, glob) = match glob.strip_prefix('!') {
+                Some(excluded) => (&mut filter.excludes, excluded),
+                None => (&mut filter.includes, glob.as_str()),
+            };
+            list.push(compile_path_glob(glob, cwd_scope)?);
+            if let Some(inside) = inside_folder(glob) {
+                list.push(compile_path_glob(&inside, cwd_scope)?);
+            }
+        }
+        Ok(filter)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.includes.is_empty() && self.excludes.is_empty()
     }
 
     pub fn matches(&self, full: &str) -> bool {
-        self.globs.is_empty() || self.globs.iter().any(|glob| glob.is_match(full))
+        let included =
+            self.includes.is_empty() || self.includes.iter().any(|glob| glob.is_match(full));
+        included && !self.excludes.iter().any(|glob| glob.is_match(full))
+    }
+}
+
+/// A value without glob syntax can name a folder, as in `--path src`; the folder's files then
+/// match too. Without a `/`, the folder matches at any depth, like any glob without one.
+fn inside_folder(glob: &str) -> Option<String> {
+    if glob.contains(['*', '?', '[', '{']) {
+        return None;
+    }
+    let folder = glob.trim_end_matches(['/', '\\']);
+    if folder.is_empty() {
+        return None;
+    }
+    let anchored = folder.contains(['/', '\\']) || folder == "." || folder == "..";
+    if anchored {
+        Some(format!("{folder}/**"))
+    } else {
+        Some(format!("**/{folder}/**"))
     }
 }
 
@@ -262,31 +337,18 @@ pub(crate) fn validate_limit(request: &PageRequest) -> Result<()> {
     Ok(())
 }
 
-/// Byte offsets of line starts, for cutting line text out of a blob.
-#[derive(Debug)]
-pub(crate) struct Lines<'text> {
-    text: &'text str,
-    starts: Vec<usize>,
+/// A definition's line as results show it.
+pub(crate) fn signature(lines: &[&str], line: u32) -> String {
+    truncate_chars(line_at(lines, line).trim(), MAX_SIGNATURE_CHARS)
 }
 
-impl<'text> Lines<'text> {
-    pub fn new(text: &'text str) -> Self {
-        let mut starts = vec![0];
-        starts.extend(text.match_indices('\n').map(|(index, _)| index + 1));
-        Self { text, starts }
-    }
-
-    /// The text of the 1-based `line`, without its line terminator.
-    pub fn get(&self, line: usize) -> &'text str {
-        let Some(&start) = line.checked_sub(1).and_then(|index| self.starts.get(index)) else {
-            return "";
-        };
-        let end = self
-            .starts
-            .get(line)
-            .map_or(self.text.len(), |&next| next - 1);
-        self.text[start..end.max(start)].trim_end_matches('\r')
-    }
+/// The 1-based `line` of `str::lines` output; empty past the end.
+pub(crate) fn line_at<'text>(lines: &[&'text str], line: u32) -> &'text str {
+    (line as usize)
+        .checked_sub(1)
+        .and_then(|index| lines.get(index))
+        .copied()
+        .unwrap_or_default()
 }
 
 pub(crate) fn fts_phrase(text: &str) -> String {

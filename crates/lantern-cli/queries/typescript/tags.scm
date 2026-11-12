@@ -29,3 +29,23 @@
 (extends_clause value: (member_expression property: (property_identifier) @name)) @reference.implementation
 (implements_clause [(type_identifier) @name (generic_type name: (type_identifier) @name)]) @reference.implementation
 (extends_type_clause type: [(type_identifier) @name (generic_type name: (type_identifier) @name)]) @reference.implementation
+
+; enum members, and top-level `const` values that only TypeScript writes
+
+(enum_body (property_identifier) @name @definition.constant)
+
+(enum_body (enum_assignment name: (property_identifier) @name) @definition.constant)
+
+(program [
+  (lexical_declaration
+    kind: "const"
+    (variable_declarator
+      name: (identifier) @name
+      value: [(as_expression) (satisfies_expression) (non_null_expression)]) @definition.constant)
+  (export_statement
+    declaration: (lexical_declaration
+      kind: "const"
+      (variable_declarator
+        name: (identifier) @name
+        value: [(as_expression) (satisfies_expression) (non_null_expression)]) @definition.constant))
+])

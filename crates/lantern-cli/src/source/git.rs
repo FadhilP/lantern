@@ -135,6 +135,9 @@ impl Walk<'_> {
         for path in &files {
             match stats.remove(path) {
                 Some(Ok(stat)) => self.stats.push((below(path), stat)),
+                Some(Err(error)) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    self.stats.push((below(path), Stat::denied_file()));
+                }
                 Some(Err(error)) => return Err(Error::io(&root.join(path), &error)),
                 None => {}
             }
@@ -225,6 +228,21 @@ fn read_rules(root: &Path, paths: &BTreeSet<String>, total: &AtomicU64) -> Resul
     Ok(rules)
 }
 
+/// Every directory that holds one of `paths`, at any depth.
+fn ancestor_dirs<'a>(paths: impl Iterator<Item = &'a String>) -> HashSet<String> {
+    let mut dirs = HashSet::new();
+    for path in paths {
+        let mut dir = path.as_str();
+        while let Some((parent, _)) = dir.rsplit_once('/') {
+            if !dirs.insert(parent.to_owned()) {
+                break;
+            }
+            dir = parent;
+        }
+    }
+    dirs
+}
+
 /// The stats of the tracked files and of the untracked files that Git's excludes keep, from one
 /// listing per directory. Errors wait in the map like in [`stat_files`]. Each level of
 /// directories is listed in parallel; ignore rules are matched on one thread, in path order,
@@ -250,16 +268,7 @@ fn list_tree(
     };
     let tracked: HashMap<String, &String> = files.iter().map(|path| (fold(path), path)).collect();
     let gitlinks: HashSet<String> = gitlinks.iter().map(|path| fold(path)).collect();
-    let mut tracked_dirs = HashSet::new();
-    for path in tracked.keys().chain(&gitlinks) {
-        let mut dir = path.as_str();
-        while let Some((parent, _)) = dir.rsplit_once('/') {
-            if !tracked_dirs.insert(parent.to_owned()) {
-                break;
-            }
-            dir = parent;
-        }
-    }
+    let tracked_dirs = ancestor_dirs(tracked.keys().chain(&gitlinks));
     let mut excludes = repo
         .excludes(index, None, Source::WorktreeThenIdMappingIfNotSkipped)
         .map_err(|error| Error::failure(format!("Git excludes: {error}")))?;
@@ -292,6 +301,12 @@ fn list_tree(
             let entries = match listing {
                 Ok(entries) => entries,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                // Git also skips a directory it cannot list; a root it cannot list fails.
+                Err(error)
+                    if error.kind() == io::ErrorKind::PermissionDenied && !dir.path.is_empty() =>
+                {
+                    continue;
+                }
                 Err(error) => return Err(Error::io(&full, &error)),
             };
             // Git does not enter an untracked directory that is a repository of its own.

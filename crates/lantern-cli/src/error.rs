@@ -4,7 +4,7 @@ use std::path::Path;
 /// The class of an [`Error`]. It decides the process exit code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorKind {
-    /// Refresh or query failure: unreadable rule, file, or Git index, or an exceeded limit.
+    /// Refresh or query failure: an unreadable rule file or Git index, or an exceeded limit.
     Failure,
     /// Bad flag, empty query, invalid regex, or a path that escapes the workspace.
     Usage,
@@ -14,6 +14,10 @@ pub enum ErrorKind {
     StaleCursor,
     /// Content kept changing, or the root lock timed out. A retry can succeed.
     Temporary,
+    /// SQLite cannot read the shard file. It exits as a failure; `index --rebuild` replaces the file.
+    Damaged,
+    /// Access to a path was denied. It exits as a failure; a refresh skips such a directory.
+    Denied,
 }
 
 impl ErrorKind {
@@ -21,7 +25,7 @@ impl ErrorKind {
     #[must_use]
     pub fn exit_code(self) -> u8 {
         match self {
-            Self::Failure => 1,
+            Self::Failure | Self::Damaged | Self::Denied => 1,
             Self::Usage => 2,
             Self::RootMoved => 3,
             Self::StaleCursor => 4,
@@ -33,7 +37,7 @@ impl ErrorKind {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Failure => "failure",
+            Self::Failure | Self::Damaged | Self::Denied => "failure",
             Self::Usage => "usage",
             Self::RootMoved => "root_moved",
             Self::StaleCursor => "stale_cursor",
@@ -73,7 +77,12 @@ impl Error {
     }
 
     pub(crate) fn io(path: &Path, error: &io::Error) -> Self {
-        Self::failure(format!("{}: {error}", path.display()))
+        let kind = if error.kind() == io::ErrorKind::PermissionDenied {
+            ErrorKind::Denied
+        } else {
+            ErrorKind::Failure
+        };
+        Self::new(kind, format!("{}: {error}", path.display()))
     }
 
     /// The class of this error.
@@ -89,6 +98,12 @@ impl From<rusqlite::Error> for Error {
         match error.sqlite_error_code() {
             Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
                 Self::temporary(message)
+            }
+            Some(rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase) => {
+                Self::new(
+                    ErrorKind::Damaged,
+                    format!("{message}; run `lantern index --rebuild`"),
+                )
             }
             _ => Self::failure(message),
         }

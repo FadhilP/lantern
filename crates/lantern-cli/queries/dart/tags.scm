@@ -19,19 +19,28 @@
 (external_setter_declaration signature: (setter_signature name: (identifier) @name)) @definition.function
 (local_function_declaration (function_signature name: (identifier) @name)) @definition.function
 
-(top_level_variable_declaration
+; A query cannot exclude an unnamed child such as `const`, so a regex keeps constants out.
+((top_level_variable_declaration
   [
     (static_final_declaration_list (static_final_declaration name: (identifier) @name) @definition.variable)
     (initialized_identifier_list (initialized_identifier name: (identifier) @name) @definition.variable)
-  ])
+  ]) @_declaration
+  (#not-match? @_declaration "^const\\s"))
+(top_level_variable_declaration
+  "const"
+  (static_final_declaration_list (static_final_declaration name: (identifier) @name) @definition.constant))
 (external_variable_declaration (identifier_list (identifier) @name @definition.variable))
 
-(declaration
+((declaration
   [
     (static_final_declaration_list (static_final_declaration name: (identifier) @name) @definition.field)
     (initialized_identifier_list (initialized_identifier name: (identifier) @name) @definition.field)
     (identifier_list (identifier) @name @definition.field)
-  ])
+  ]) @_declaration
+  (#not-match? @_declaration "^(static\\s+)?const\\s"))
+(declaration
+  "const"
+  (static_final_declaration_list (static_final_declaration name: (identifier) @name) @definition.constant))
 
 ; `Shop.named()` has two name fields. The anchor keeps the last one, which is next to the parameters.
 (method_declaration

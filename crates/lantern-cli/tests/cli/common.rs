@@ -82,26 +82,55 @@ impl Fixture {
     }
 
     pub fn ok_in(&self, dir: &Path, args: &[&str]) -> Value {
-        let run = self.lantern_in(dir, args, &[]);
+        let mut run = self.lantern_in(dir, args, &[]);
+        if self.indexed_on_request(dir, &run.stderr) {
+            run = self.lantern_in(dir, args, &[]);
+        }
         assert_eq!(run.code, 0, "lantern {args:?} failed: {}", run.stderr);
         run.json
     }
 
     /// Runs a command that must succeed and returns its default text output.
     pub fn text(&self, args: &[&str]) -> String {
-        let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
-            .args(args)
-            .current_dir(&self.root)
-            .env("LANTERN_HOME", &self.home)
-            .output()
-            .expect("run lantern");
+        let run = || {
+            Command::new(env!("CARGO_BIN_EXE_lantern"))
+                .args(args)
+                .current_dir(&self.root)
+                .env("LANTERN_HOME", &self.home)
+                .output()
+                .expect("run lantern")
+        };
+        let mut output = run();
+        if self.indexed_on_request(&self.root, &String::from_utf8_lossy(&output.stderr)) {
+            output = run();
+        }
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "lantern {args:?} failed: {stderr}");
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
+    /// A query in a plain folder needs a first `lantern index`, as a user runs it; this runs it
+    /// when the query was refused for that reason.
+    fn indexed_on_request(&self, dir: &Path, stderr: &str) -> bool {
+        if !stderr.contains("indexes a plain folder only on request") {
+            return false;
+        }
+        self.ok_in(dir, &["index"]);
+        true
+    }
+
     pub fn git(&self, relative: &str, args: &[&str]) -> String {
         git(&self.path(relative), args)
+    }
+
+    /// The shard file of the fixture's only root.
+    pub fn shard(&self) -> PathBuf {
+        fs::read_dir(self.home.join("roots"))
+            .expect("roots dir")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "sqlite"))
+            .expect("one shard")
     }
 }
 
@@ -188,4 +217,47 @@ pub fn count(document: &Value, field: &str) -> u64 {
     document[field]
         .as_u64()
         .unwrap_or_else(|| panic!("{field} in {document}"))
+}
+
+/// Denies all access to a directory until dropped; `None` when the user can list it anyway
+/// (root).
+pub fn deny_dir(dir: &Path) -> Option<DeniedDir> {
+    let denied = DeniedDir(dir.to_path_buf());
+    denied.set(false);
+    fs::read_dir(dir).is_err().then_some(denied)
+}
+
+#[derive(Debug)]
+pub struct DeniedDir(PathBuf);
+
+impl DeniedDir {
+    #[cfg(unix)]
+    fn set(&self, allowed: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if allowed { 0o755 } else { 0o000 };
+        fs::set_permissions(&self.0, fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+
+    #[cfg(windows)]
+    fn set(&self, allowed: bool) {
+        let user = std::env::var("USERNAME").expect("USERNAME");
+        let rule = if allowed {
+            vec!["/remove:d".to_owned(), user]
+        } else {
+            vec!["/deny".to_owned(), format!("{user}:(OI)(CI)F")]
+        };
+        let status = Command::new("icacls")
+            .arg(&self.0)
+            .args(rule)
+            .output()
+            .expect("run icacls")
+            .status;
+        assert!(status.success(), "icacls failed");
+    }
+}
+
+impl Drop for DeniedDir {
+    fn drop(&mut self) {
+        self.set(true);
+    }
 }

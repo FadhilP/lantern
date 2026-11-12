@@ -14,11 +14,12 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::extract::{self, Extraction};
 use crate::fsmeta::{self, Content, Stat};
 use crate::home::{FOLDER_DEFAULTS, Home};
-use crate::language::Language;
+use crate::language::{FileFlags, Language};
 use crate::limits::{self, MAX_PARSE_ATTEMPTS, RACY_SLACK_MS, REFRESH_ATTEMPTS};
 use crate::source::{Entry, Inventory, Scan, SourceKind};
 use crate::store::remove_database;
-use crate::store::shard::{self, BlobKey, FileRow, Meta, Names, NewBlob};
+use crate::store::shard::{self, BlobIds, BlobKey, FileRow, Meta, Names, NewBlob};
+use crate::store::trigram::{Pending, Trigrams};
 
 /// Settings that decide eligibility and the refresh deadline.
 #[derive(Debug, Clone)]
@@ -78,14 +79,15 @@ pub(crate) fn refresh(
 ) -> Result<Refreshed> {
     let deadline = settings.timeout.map(|timeout| Instant::now() + timeout);
     let shard_path = home.shard_path(&target.root_key);
-    let warm = shard::open_existing(&shard_path)?
-        .map(|conn| shard::meta(&conn))
-        .transpose()?
-        .flatten()
-        .is_some_and(|meta| meta.indexed_at.is_some());
+    let warm = match shard::stored_meta(&shard_path) {
+        Err(error) if error.kind() == ErrorKind::Damaged => false,
+        meta => meta?.is_some_and(|meta| meta.indexed_at.is_some()),
+    };
     let deadline = deadline.filter(|_| warm);
     let lock_timeout = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
     let _lock = home.lock(&target.root_key, lock_timeout)?;
+    // A killed rebuild leaves its staging copy of the indexed text behind.
+    remove_database(&staging_path(&shard_path))?;
     // A cold index and a rebuild read the whole tree, so they have no deadline.
     let deadline = deadline.filter(|_| mode == Mode::Incremental);
     match mode {
@@ -101,29 +103,48 @@ fn rebuild(
     shard_path: &Path,
     deadline: Option<Instant>,
 ) -> Result<Refreshed> {
-    let mut live = shard::open(shard_path)?;
-    let generation = shard::meta(&live)?.map_or(0, |meta| meta.generation);
-    let staging = shard_path.with_extension("rebuild");
-    remove_database(&staging)?;
-    let mut refreshed = refresh_shard(
+    let (mut live, generation) = match open_live(shard_path) {
+        // The rebuild writes every page again, so it replaces a file SQLite cannot read.
+        Err(error) if error.kind() == ErrorKind::Damaged => {
+            remove_database(shard_path)?;
+            open_live(shard_path)?
+        }
+        opened => opened?,
+    };
+    let staging = staging_path(shard_path);
+    let staged = refresh_shard(
         home,
         target,
         settings,
         &staging,
         deadline,
         Some(generation + 1),
-    )?;
-    // The backup API replaces the live pages in one transaction; WAL readers keep their snapshot.
-    live.restore(
-        rusqlite::MAIN_DB,
-        &staging,
-        None::<fn(rusqlite::backup::Progress)>,
-    )?;
-    remove_database(&staging)?;
-    // The live WAL still holds the old pages, removed content included.
-    live.execute("UPDATE meta SET checkpoint_pending = 1", [])?;
+    )
+    .and_then(|refreshed| {
+        // The backup API replaces the live pages in one transaction; WAL readers keep their snapshot.
+        live.restore(
+            rusqlite::MAIN_DB,
+            &staging,
+            None::<fn(rusqlite::backup::Progress)>,
+        )?;
+        Ok(refreshed)
+    });
+    // Also on failure: the staging file holds a copy of the indexed text.
+    let removed = remove_database(&staging);
+    let mut refreshed = staged?;
+    removed?;
     refreshed.checkpoint_pending = !checkpoint(&live)?;
     Ok(refreshed)
+}
+
+fn open_live(shard_path: &Path) -> Result<(Connection, i64)> {
+    let live = shard::open(shard_path)?;
+    let generation = shard::meta(&live)?.map_or(0, |meta| meta.generation);
+    Ok((live, generation))
+}
+
+fn staging_path(shard_path: &Path) -> PathBuf {
+    shard_path.with_extension("rebuild")
 }
 
 fn refresh_shard(
@@ -135,6 +156,11 @@ fn refresh_shard(
     forced_generation: Option<i64>,
 ) -> Result<Refreshed> {
     let mut conn = shard::open(shard_path)?;
+    if forced_generation.is_some() {
+        // A rebuild writes a staging file that nothing reads and a failure deletes, so it needs
+        // no WAL and no sync; the memory journal still allows a rollback.
+        conn.execute_batch("PRAGMA journal_mode = MEMORY; PRAGMA synchronous = OFF")?;
+    }
     let meta = shard::meta(&conn)?;
     let defaults_file = home.defaults_path();
     let scan = Scan {
@@ -152,7 +178,9 @@ fn refresh_shard(
     };
     let mut committed = job.attempt_until_stable(&mut conn)?;
     let was_pending = meta.as_ref().is_some_and(|meta| meta.checkpoint_pending);
-    if committed.secure || was_pending {
+    // A staging file has no WAL; its checkpoint would clear the flag the live shard needs.
+    let staging = forced_generation.is_some();
+    if !staging && (committed.secure || was_pending) {
         committed.refreshed.checkpoint_pending = !checkpoint(&conn)?;
     }
     if committed.results_changed {
@@ -167,6 +195,19 @@ struct Committed {
     /// Removed content may be in the WAL until a checkpoint empties it.
     secure: bool,
     results_changed: bool,
+}
+
+impl Committed {
+    fn unchanged() -> Self {
+        Self {
+            refreshed: Refreshed {
+                counts: RefreshCounts::default(),
+                checkpoint_pending: false,
+            },
+            secure: false,
+            results_changed: false,
+        }
+    }
 }
 
 struct Job<'job> {
@@ -192,6 +233,18 @@ struct Work<'work> {
 struct Applied {
     counts: RefreshCounts,
     results_changed: bool,
+    secure: bool,
+    /// The scan after the last read; `None` when nothing changed.
+    rescan: Option<Inventory>,
+}
+
+impl Applied {
+    fn add(&mut self, more: Self) {
+        self.counts += more.counts;
+        self.results_changed |= more.results_changed;
+        self.secure |= more.secure;
+        self.rescan = more.rescan;
+    }
 }
 
 /// The inventory against the stored rows.
@@ -244,6 +297,11 @@ fn diff<'diff>(
     }
 }
 
+/// An unreadable file is read again at every refresh, so it is never trusted.
+fn readable(row: &FileRow) -> bool {
+    row.flags & FileFlags::UNREADABLE == 0
+}
+
 /// Git's racy rule. A file changed at or after the last scan can change again and keep its
 /// stat, so a row is trusted without a read only when its file times are older than that scan.
 fn settled(stat: &Stat, last_scan: Option<i64>) -> bool {
@@ -270,6 +328,7 @@ enum Prepared {
         reused: bool,
     },
     New(Box<NewBlob>),
+    Unreadable,
 }
 
 impl Job<'_> {
@@ -307,19 +366,15 @@ impl Job<'_> {
         let existing = shard::files(conn)?;
         let last_scan = self.meta.map(|meta| meta.scanned_at);
         let trusted = |path: &str, row: &FileRow| {
-            !policy_changed && !relabeled.contains(path) && settled(&row.stat, last_scan)
+            readable(row)
+                && !policy_changed
+                && !relabeled.contains(path)
+                && settled(&row.stat, last_scan)
         };
         let diff = diff(&inventory.files, &existing, trusted);
 
         let root = self.target.root.to_string_lossy().into_owned();
-        let meta_current = self.meta.is_some_and(|meta| {
-            meta.policy == policy
-                && meta.extractor == extractor
-                && meta.source == self.target.source
-                && meta.root == root
-                && meta.head == inventory.head
-                && meta.branch == inventory.branch
-        });
+        let meta_current = self.meta_current(&policy, &extractor, &root, &inventory);
         // A timeout depends on load, so a timed-out blob is parsed again, a few times at most.
         let retry = if reextract {
             Vec::new()
@@ -329,17 +384,10 @@ impl Job<'_> {
         let nothing_to_do =
             diff.is_empty() && retry.is_empty() && meta_current && self.forced_generation.is_none();
         if nothing_to_do {
-            return Ok(Committed {
-                refreshed: Refreshed {
-                    counts: RefreshCounts::default(),
-                    checkpoint_pending: false,
-                },
-                secure: false,
-                results_changed: false,
-            });
+            return Ok(Committed::unchanged());
         }
 
-        // Removed and re-policied content must not stay readable in the FTS index or the WAL.
+        // Removed and re-policied content must not stay readable in the trigram index or the WAL.
         let secure = !diff.removed.is_empty() || (policy_changed && self.meta.is_some());
         let work = Work {
             existing: &existing,
@@ -353,17 +401,17 @@ impl Job<'_> {
             reextract,
             secure,
         };
+        // A new shard has only rows that this attempt writes, so it skips their checks.
+        conn.pragma_update(None, "foreign_keys", self.meta.is_some())?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut applied = self.apply(&tx, work)?;
+        let inventory = self.catch_up(&tx, inventory, &mut applied)?;
         let Applied {
             counts,
             results_changed,
-        } = self.apply(&tx, work)?;
-        if results_changed {
-            let again = self.scan.inventory(self.target.source)?;
-            if !again.same_as(&inventory) {
-                return Err(Error::temporary("files changed during the refresh"));
-            }
-        }
+            secure,
+            ..
+        } = applied;
 
         let committed_generation = shard::meta(&tx)?.map_or(0, |meta| meta.generation);
         let expected_generation = self.meta.map_or(0, |meta| meta.generation);
@@ -393,7 +441,11 @@ impl Job<'_> {
                 generation,
                 scanned_at,
                 // A commit that removes nothing must not clear a checkpoint that is still owed.
-                checkpoint_pending: secure || self.meta.is_some_and(|meta| meta.checkpoint_pending),
+                // A rebuild's meta reaches the live shard with its pages, whose WAL still holds
+                // the old pages.
+                checkpoint_pending: secure
+                    || self.forced_generation.is_some()
+                    || self.meta.is_some_and(|meta| meta.checkpoint_pending),
             },
         )?;
         tx.commit()?;
@@ -404,6 +456,61 @@ impl Job<'_> {
             },
             secure,
             results_changed,
+        })
+    }
+
+    /// Applies the files that changed while the attempt read them, until a scan after the last
+    /// read matches what is written. Returns that scan.
+    fn catch_up(
+        &self,
+        tx: &Connection,
+        mut inventory: Inventory,
+        applied: &mut Applied,
+    ) -> Result<Inventory> {
+        for round in 0..=REFRESH_ATTEMPTS {
+            let Some(again) = applied.rescan.take() else {
+                return Ok(inventory);
+            };
+            if again.same_as(&inventory) {
+                return Ok(again);
+            }
+            if again.rules_digest != inventory.rules_digest {
+                return Err(Error::temporary("ignore rules changed during the refresh"));
+            }
+            if round == REFRESH_ATTEMPTS {
+                break;
+            }
+            let existing = shard::files(tx)?;
+            // Every row now holds the stat of the scan before; only a changed stat needs a read.
+            let diff = diff(&again.files, &existing, |_, row| readable(row));
+            let work = Work {
+                existing: &existing,
+                reuse: HashMap::new(),
+                secure: !diff.removed.is_empty(),
+                diff,
+                retry: Vec::new(),
+                reextract: false,
+            };
+            applied.add(self.apply(tx, work)?);
+            inventory = again;
+        }
+        Err(Error::temporary("files kept changing during the refresh"))
+    }
+
+    fn meta_current(
+        &self,
+        policy: &str,
+        extractor: &str,
+        root: &str,
+        inventory: &Inventory,
+    ) -> bool {
+        self.meta.is_some_and(|meta| {
+            meta.policy == policy
+                && meta.extractor == extractor
+                && meta.source == self.target.source
+                && meta.root == root
+                && meta.head == inventory.head
+                && meta.branch == inventory.branch
         })
     }
 
@@ -420,6 +527,8 @@ impl Job<'_> {
         let stored_keys = shard::blob_keys(tx)?;
         let mut inserted: HashMap<BlobKey, i64> = HashMap::new();
         let mut names = Names::default();
+        let mut ids = BlobIds::load(tx)?;
+        let mut trigrams = Pending::new(tx)?;
         let mut counts = RefreshCounts::default();
         let mut results_changed = reextract
             || !retry.is_empty()
@@ -437,6 +546,7 @@ impl Job<'_> {
             |(path, entry): &(&String, &Entry)| self.prepare(path, entry, &reuse, &stored_keys);
         prepare_all(&diff.candidates, prepare, |index, prepared| {
             let (path, entry) = diff.candidates[index];
+            let mut flags = entry.flags.0;
             let blob_id = match prepared {
                 Prepared::Known { blob_id, reused } => {
                     counts.reused += u64::from(reused);
@@ -447,14 +557,19 @@ impl Job<'_> {
                     if let Some(&id) = inserted.get(&blob.key) {
                         Some(id)
                     } else {
-                        let id = shard::insert_blob(tx, &mut names, &blob)?;
+                        let id =
+                            shard::insert_blob(tx, &mut ids, &mut names, &mut trigrams, &blob)?;
                         inserted.insert(blob.key, id);
                         Some(id)
                     }
                 }
+                Prepared::Unreadable => {
+                    flags |= FileFlags::UNREADABLE;
+                    None
+                }
             };
             let old = existing.get(path);
-            if old.is_none_or(|old| old.blob_id != blob_id || old.flags != entry.flags.0) {
+            if old.is_none_or(|old| old.blob_id != blob_id || old.flags != flags) {
                 counts.changed += 1;
                 results_changed = true;
             }
@@ -468,30 +583,44 @@ impl Job<'_> {
                 path,
                 FileRow {
                     blob_id,
-                    flags: entry.flags.0,
+                    flags,
                     stat: entry.stat,
                 },
             ));
             Ok(())
         })?;
+        shard::create_indexes(tx)?;
 
-        for (path, row) in rows.iter().chain(&diff.flag_updates) {
-            shard::upsert_file(tx, path, row)?;
-        }
-        for (path, row) in &diff.removed {
-            shard::delete_file(tx, path)?;
-            touched.extend(row.blob_id);
-            counts.removed += 1;
-        }
-        let orphans = shard::delete_orphans(tx, touched)?;
-        if secure && orphans > 0 {
-            // Merge FTS segments so deleted postings are dropped, not only marked.
-            tx.execute("INSERT INTO blobs_fts (blobs_fts) VALUES ('optimize')", [])?;
-            shard::delete_unused_names(tx)?;
-        }
-        Ok(Applied {
-            counts,
-            results_changed,
+        thread::scope(|scope| {
+            // Every read is done, so the scan that checks them runs beside the writes.
+            let rescan =
+                results_changed.then(|| scope.spawn(|| self.scan.inventory(self.target.source)));
+            for (path, row) in rows.iter().chain(&diff.flag_updates) {
+                shard::upsert_file(tx, path, row)?;
+            }
+            for (path, row) in &diff.removed {
+                shard::delete_file(tx, path)?;
+                touched.extend(row.blob_id);
+                counts.removed += 1;
+            }
+            let orphans = shard::delete_orphans(tx, &mut trigrams, touched)?;
+            trigrams.finish(tx)?;
+            if secure && orphans > 0 {
+                shard::delete_unused_names(tx)?;
+            }
+            let rescan = rescan
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
+                .transpose()?;
+            Ok(Applied {
+                counts,
+                results_changed,
+                secure,
+                rescan,
+            })
         })
     }
 
@@ -528,10 +657,14 @@ impl Job<'_> {
                     "{path} vanished during the refresh"
                 )));
             }
-            Err(error) => return Err(Error::io(&full_path, &error)),
+            Err(error) if fsmeta::is_exhausted(&error) => {
+                return Err(Error::io(&full_path, &error));
+            }
+            Err(_) => return Ok(Prepared::Unreadable),
         };
         let bytes = match fsmeta::read_stable(&full_path, &current, self.settings.max_file_size)? {
             Content::Text(bytes) => bytes,
+            Content::Unreadable => return Ok(Prepared::Unreadable),
             Content::Binary | Content::TooLarge => {
                 return Ok(Prepared::Known {
                     blob_id: None,
@@ -549,7 +682,7 @@ impl Job<'_> {
             });
         }
         Ok(Prepared::New(Box::new(new_blob(
-            language, &bytes, text, key,
+            language, &bytes, &text, key,
         )?)))
     }
 }
@@ -588,23 +721,18 @@ fn checkpoint(conn: &Connection) -> Result<bool> {
     Ok(true)
 }
 
-fn new_blob(
-    language: Option<Language>,
-    bytes: &[u8],
-    text: String,
-    key: BlobKey,
-) -> Result<NewBlob> {
+fn new_blob(language: Option<Language>, bytes: &[u8], text: &str, key: BlobKey) -> Result<NewBlob> {
     let extraction = language.map_or_else(Extraction::default, |language| {
-        extract::extract(language, &text)
+        extract::extract(language, text)
     });
     let compressed = zstd::encode_all(bytes, 3)
         .map_err(|error| Error::failure(format!("compression failed: {error}")))?;
     Ok(NewBlob {
         key,
         language: language.map(Language::name),
-        lines: text.lines().count() as i64,
+        lines: i64::try_from(text.lines().count()).unwrap_or(i64::MAX),
         compressed,
-        text,
+        trigrams: Trigrams::of(text),
         extraction,
     })
 }
@@ -641,22 +769,15 @@ where
     })
 }
 
-const REEXTRACT_BATCH: i64 = 256;
+const REEXTRACT_BATCH: usize = 256;
 
 /// Re-extracts every stored blob after an extractor change, without reading the disk.
 fn reextract_all(conn: &Connection, names: &mut Names, counts: &mut RefreshCounts) -> Result<()> {
-    let mut after = 0;
-    loop {
-        let ids: Vec<i64> = conn
-            .prepare_cached("SELECT id FROM blobs WHERE id > ?1 ORDER BY id LIMIT ?2")?
-            .query_map([after, REEXTRACT_BATCH], |row| row.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        let Some(&last) = ids.last() else {
-            return Ok(());
-        };
-        after = last;
-        reextract_blobs(conn, names, counts, &ids)?;
-    }
+    let ids: Vec<i64> = conn
+        .prepare("SELECT id FROM blobs ORDER BY id")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    reextract_blobs(conn, names, counts, &ids)
 }
 
 /// Re-extracts the given blobs from their stored content and language.
@@ -666,7 +787,7 @@ fn reextract_blobs(
     counts: &mut RefreshCounts,
     ids: &[i64],
 ) -> Result<()> {
-    for batch in ids.chunks(REEXTRACT_BATCH as usize) {
+    for batch in ids.chunks(REEXTRACT_BATCH) {
         let stored: Vec<(i64, Vec<u8>, Option<String>)> = batch
             .iter()
             .map(|&id| {

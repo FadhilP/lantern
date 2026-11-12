@@ -2,7 +2,7 @@
 
 use std::process::Command;
 
-use crate::common::{Fixture, count, files_with, git, names, strings};
+use crate::common::{Fixture, count, deny_dir, files_with, git, names, strings};
 
 #[test]
 fn scoped_ignores_negation_and_default_opt_ins() {
@@ -108,6 +108,165 @@ fn work_limits_fail_without_publishing() {
     let run = f.lantern_in(&f.root, &["index"], &[("LANTERN_TEST_MAX_ENTRIES", "3")]);
     assert_eq!(run.code, 1, "{}", run.stderr);
     assert_eq!(f.ok(&["status"])["indexed"], false);
+    let query = f.lantern_in(&f.root, &["symbols", "MARK"], &[]);
+    assert_eq!(
+        query.code, 2,
+        "a failed first index must not unlock queries"
+    );
+}
+
+#[test]
+fn a_failed_rebuild_leaves_no_staging_copy() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let f = Fixture::new();
+    for index in 0..5 {
+        f.write(&format!("f{index}.ts"), "MARK\n");
+    }
+    f.ok(&["index"]);
+    let run = f.lantern_in(
+        &f.root,
+        &["index", "--rebuild"],
+        &[("LANTERN_TEST_MAX_ENTRIES", "3")],
+    );
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    let staged: Vec<_> = std::fs::read_dir(f.home.join("roots"))
+        .expect("roots")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "rebuild"))
+        .collect();
+    assert!(staged.is_empty(), "{staged:?}");
+}
+
+#[test]
+fn a_killed_rebuild_leaves_no_staging_copy_after_the_next_query() {
+    let f = Fixture::new();
+    f.write("a.ts", "export function alpha() {}\n");
+    f.ok(&["index"]);
+    let staging = f.shard().with_extension("rebuild");
+    std::fs::write(&staging, "MARK\n").expect("write staging copy");
+    f.ok(&["symbols", "alpha"]);
+    assert!(!staging.exists());
+}
+
+#[test]
+fn a_damaged_shard_asks_for_a_rebuild_that_replaces_it() {
+    let f = Fixture::new();
+    f.write("a.ts", "export function alpha() {}\n");
+    f.ok(&["index"]);
+    // A damaged header is SQLITE_NOTADB; damage after the 100-byte header is SQLITE_CORRUPT.
+    for keep in [0, 100] {
+        damage(&f.shard(), keep);
+        let damaged = f.lantern(&["symbols", "alpha"]);
+        assert_eq!(damaged.code, 1, "{}", damaged.stderr);
+        assert!(
+            damaged.stderr.contains("lantern index --rebuild"),
+            "{}",
+            damaged.stderr
+        );
+        f.ok(&["index", "--rebuild"]);
+        assert_eq!(names(&f.ok(&["symbols", "alpha"])), strings(&["alpha"]));
+    }
+    damage(&f.shard(), 0);
+    f.ok(&["prune"]);
+    assert!(
+        !f.home
+            .join("roots")
+            .read_dir()
+            .expect("roots")
+            .any(|entry| {
+                entry.is_ok_and(|entry| entry.path().extension().is_some_and(|ext| ext == "sqlite"))
+            })
+    );
+}
+
+fn damage(shard: &std::path::Path, keep: usize) {
+    let mut bytes = std::fs::read(shard).expect("read shard");
+    bytes[keep..].fill(0xAB);
+    std::fs::write(shard, bytes).expect("damage the shard");
+}
+
+#[test]
+fn a_shard_from_an_older_schema_is_built_again() {
+    let f = Fixture::new();
+    f.write("a.ts", "export function alpha() {}\n");
+    f.ok(&["index"]);
+    rusqlite::Connection::open(f.shard())
+        .expect("open shard")
+        .execute_batch("PRAGMA user_version = 2")
+        .expect("downgrade the shard");
+    f.write("b.ts", "export function beta() {}\n");
+    assert_eq!(names(&f.ok(&["symbols", "beta"])), strings(&["beta"]));
+    let version: i64 = rusqlite::Connection::open(f.shard())
+        .expect("open shard")
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read version");
+    assert!(version > 2, "{version}");
+}
+
+#[test]
+fn prune_leaves_a_newer_shard_alone_and_still_prunes_the_rest() {
+    let f = Fixture::new();
+    f.write("a.ts", "export function alpha() {}\n");
+    f.ok(&["index"]);
+    let shard = f.shard();
+    rusqlite::Connection::open(&shard)
+        .expect("open shard")
+        .execute_batch("PRAGMA user_version = 99")
+        .expect("mark the shard as newer");
+    let stray = f.home.join("roots").join("0123456789abcdef.rebuild");
+    std::fs::write(&stray, "MARK\n").expect("write stray file");
+    assert_eq!(count(&f.ok(&["prune"]), "removed_files"), 1);
+    assert!(shard.exists());
+    assert!(!stray.exists());
+}
+
+#[test]
+fn an_unreadable_file_is_skipped_counted_and_read_once_readable() {
+    let f = Fixture::new();
+    f.write("a.ts", "export function alpha() {}\n");
+    f.write("held.ts", "export function before() {}\n");
+    f.ok(&["index"]);
+    f.write("held.ts", "export function after() {}\n");
+    // Past the 2 s racy window, so only the unreadable mark makes the next refresh read it.
+    std::thread::sleep(std::time::Duration::from_millis(2_100));
+    let Some(denied) = deny_read(&f.path("held.ts")) else {
+        return;
+    };
+    assert_eq!(names(&f.ok(&["symbols", "alpha"])), strings(&["alpha"]));
+    assert!(names(&f.ok(&["symbols", "before"])).is_empty());
+    assert_eq!(count(&f.ok(&["status"]), "unreadable_files"), 1);
+    drop(denied);
+    assert_eq!(names(&f.ok(&["symbols", "after"])), strings(&["after"]));
+    assert_eq!(count(&f.ok(&["status"]), "unreadable_files"), 0);
+}
+
+/// Holds the file open with no sharing, as another process can on Windows.
+#[cfg(windows)]
+fn deny_read(path: &std::path::Path) -> Option<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(path)
+        .expect("hold the file");
+    Some(held)
+}
+
+/// Removes read permission until dropped; `None` when the user can read it anyway (root).
+#[cfg(unix)]
+fn deny_read(path: &std::path::Path) -> Option<impl Drop> {
+    use std::os::unix::fs::PermissionsExt;
+    struct Restore(std::path::PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o644));
+        }
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let restore = Restore(path.to_path_buf());
+    std::fs::File::open(path).is_err().then_some(restore)
 }
 
 #[test]
@@ -316,4 +475,21 @@ fn files_out_of_parse_retries_stay_visible_until_a_rebuild() {
     assert_eq!(count(&f.ok(&["status"]), "unparsed_files"), 0);
     assert_eq!(names(&f.ok(&["symbols", "lost"])), strings(&["lost"]));
     assert_eq!(f.text(&["outline", "b.ts"]), "no results\n");
+}
+
+#[test]
+fn a_denied_directory_with_rules_is_skipped() {
+    let f = Fixture::new();
+    f.write("a.ts", "export function alpha() {}\n");
+    f.write("sub/.gitignore", "*.log\n");
+    f.write("sub/s.ts", "export function inside() {}\n");
+    f.ok(&["index"]);
+    let Some(denied) = deny_dir(&f.path("sub")) else {
+        return;
+    };
+    f.write("b.ts", "export function beta() {}\n");
+    assert_eq!(names(&f.ok(&["symbols", "beta"])), strings(&["beta"]));
+    assert!(names(&f.ok(&["symbols", "inside"])).is_empty());
+    drop(denied);
+    assert_eq!(names(&f.ok(&["symbols", "inside"])), strings(&["inside"]));
 }

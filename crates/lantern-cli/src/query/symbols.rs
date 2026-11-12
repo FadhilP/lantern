@@ -1,29 +1,34 @@
 //! `symbols`: where is X defined?
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::Connection;
 use serde::Serialize;
 
 use super::{
-    Lines, Opened, Page, PageRequest, PathFilter, fts_phrase, language_names, validate_limit,
-    validate_text,
+    Opened, Page, PageRequest, PathFilter, fts_phrase, language_names, line_at, signature,
+    validate_limit, validate_text,
 };
 use crate::error::Result;
-use crate::extract::{SymbolKind, extract, truncate_chars};
-use crate::language::{FileFlags, Language};
+use crate::extract::{SymbolKind, truncate_chars};
+use crate::language::FileFlags;
 use crate::limits::{MAX_BODY_LINES, MAX_LINE_CHARS};
 use crate::store::shard::{self, initials};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SymbolQuery {
-    pub query: String,
-    pub kind: Option<SymbolKind>,
+    /// `None` lists every definition in path and line order.
+    pub query: Option<String>,
+    /// Empty means any kind.
+    pub kind: Vec<SymbolKind>,
     pub language: Option<String>,
     pub path: Vec<String>,
     pub include_generated: bool,
     /// Adds the source lines of each definition.
     pub body: bool,
+    /// When a name matches exactly (in any case), drops the prefix, initials, and substring
+    /// matches.
+    pub exact_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -62,12 +67,9 @@ pub struct SymbolsFound {
 /// path length; smaller sorts first.
 type RankKey = (Tier, bool, usize, u8, bool, usize);
 
-#[derive(Debug)]
 struct Ranked {
     key: RankKey,
-    column: u32,
-    blob_id: i64,
-    hit: SymbolHit,
+    row: Row,
 }
 
 pub(crate) fn run(
@@ -75,32 +77,62 @@ pub(crate) fn run(
     query: &SymbolQuery,
     request: &PageRequest,
 ) -> Result<SymbolsFound> {
-    validate_text("the symbol query", &query.query)?;
     validate_limit(request)?;
     let filter = PathFilter::new(&query.path, &opened.scope)?;
     let languages = language_names(query.language.as_deref())?;
     let description = format!("symbols:{query:?}:{}", opened.scope);
     let needed = opened.needed(&description, request)?;
-
-    let (container, name) = split_qualified(&query.query);
-    let mut rows = candidates(&opened.conn, name)?;
-    rows.retain(|row| {
-        let flags = FileFlags(row.flags);
-        opened.accept(&row.hit.path, &filter)
-            && (query.include_generated || !flags.is_generated())
-            && query.kind.is_none_or(|kind| kind == row.hit.kind)
+    let passes = |row: &Row| {
+        (query.include_generated || !FileFlags(row.flags).is_generated())
+            && (query.kind.is_empty() || query.kind.contains(&row.hit.kind))
             && languages.as_ref().is_none_or(|names| {
                 row.hit
                     .language
                     .as_deref()
                     .is_some_and(|language| names.contains(&language))
             })
-    });
+    };
+    let (mut rows, other_containers) = match &query.query {
+        Some(text) => {
+            validate_text("the symbol query", text)?;
+            let keep = |row: &Row| opened.accept(&row.hit.path, &filter) && passes(row);
+            ranked(opened, text, query.exact_only, needed.rows, keep)?
+        }
+        None => (listed(opened, &filter, needed.rows, passes)?, Vec::new()),
+    };
+    // Only the page's own rows are shown; the rest need no text.
+    let shown = rows.iter_mut().skip(needed.offset).take(request.limit);
+    add_text(opened, shown, query.body)?;
+    let page = opened.page(
+        &description,
+        request,
+        &filter,
+        rows.into_iter().map(|row| row.hit).collect(),
+    )?;
+    Ok(SymbolsFound {
+        page,
+        other_containers,
+    })
+}
+
+/// The best `rows` definitions whose name matches `text`, best first, and for `Container.name`
+/// that matched nothing, other containers that define `name`.
+fn ranked(
+    opened: &Opened,
+    text: &str,
+    exact_only: bool,
+    rows: usize,
+    keep: impl Fn(&Row) -> bool,
+) -> Result<(Vec<Row>, Vec<String>)> {
+    let (container, name) = split_qualified(text);
+    let mut found = candidates(&opened.conn, name)?;
+    found.retain(|row| keep(row));
     let other_containers = match container {
-        Some(container) => keep_in_container(&mut rows, name, container),
+        Some(container) => keep_in_container(&mut found, name, container),
         None => Vec::new(),
     };
-    let mut all: Vec<Ranked> = rows
+    drop_constructors_beside_their_type(&mut found);
+    let mut all: Vec<Ranked> = found
         .into_iter()
         .map(|row| {
             let tier = Tier::of(&row.hit.name, name);
@@ -114,41 +146,94 @@ pub(crate) fn run(
                     FileFlags(row.flags).is_test(),
                     row.hit.path.len(),
                 ),
-                column: row.column,
-                blob_id: row.blob_id,
-                hit: row.hit,
+                row,
             }
         })
         .collect();
+    let is_exact = |ranked: &Ranked| ranked.key.0 <= Tier::ExactIgnoringCase;
+    if exact_only && all.iter().any(is_exact) {
+        all.retain(is_exact);
+    }
 
     let order = |a: &Ranked, b: &Ranked| {
+        let (x, y) = (&a.row, &b.row);
         a.key
             .cmp(&b.key)
-            .then_with(|| a.hit.path.cmp(&b.hit.path))
-            .then_with(|| a.hit.line.cmp(&b.hit.line))
-            .then_with(|| a.column.cmp(&b.column))
-            .then_with(|| a.hit.name.cmp(&b.hit.name))
+            .then_with(|| x.hit.path.cmp(&y.hit.path))
+            .then_with(|| x.hit.line.cmp(&y.hit.line))
+            .then_with(|| x.column.cmp(&y.column))
+            .then_with(|| x.hit.name.cmp(&y.hit.name))
     };
     // Sort only the rows the page needs; a short query can match most of the index.
-    if all.len() > needed {
-        all.select_nth_unstable_by(needed, order);
-        all.truncate(needed);
+    if all.len() > rows {
+        all.select_nth_unstable_by(rows, order);
+        all.truncate(rows);
     }
     all.sort_unstable_by(order);
-    if query.body {
-        // Rows before the page offset are skipped by `page`; they need no body.
-        let offset = needed - request.limit - 1;
-        add_bodies(opened, all.iter_mut().skip(offset))?;
-    }
-    let page = opened.page(
-        &description,
-        request,
-        all.into_iter().map(|ranked| ranked.hit).collect(),
+    let found = all.into_iter().map(|ranked| ranked.row).collect();
+    Ok((found, other_containers))
+}
+
+/// The first `rows` definitions in the files that pass `filter`, in path and line order.
+fn listed(
+    opened: &Opened,
+    filter: &PathFilter,
+    rows: usize,
+    keep: impl Fn(&Row) -> bool,
+) -> Result<Vec<Row>> {
+    let mut files = opened.conn.prepare(
+        "SELECT f.path, f.flags, f.blob_id, b.language
+         FROM files f JOIN blobs b ON b.id = f.blob_id ORDER BY f.path",
     )?;
-    Ok(SymbolsFound {
-        page,
-        other_containers,
-    })
+    let mut symbols = opened.conn.prepare(
+        "SELECT n.name, s.kind, s.container, s.line, s.end_line, s.col, s.start_line
+         FROM symbols s JOIN names n ON n.id = s.name_id
+         WHERE s.blob_id = ?1 ORDER BY s.line, s.col",
+    )?;
+    let files = files.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, u8>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    let mut found = Vec::new();
+    for file in files {
+        let (path, flags, blob_id, language) = file?;
+        if !opened.accept(&path, filter) {
+            continue;
+        }
+        let in_file = symbols.query_map([blob_id], |row| {
+            Ok(Row {
+                hit: SymbolHit {
+                    name: row.get(0)?,
+                    kind: row.get(1)?,
+                    container: row.get(2)?,
+                    line: row.get(3)?,
+                    end_line: row.get(4)?,
+                    signature: String::new(),
+                    language: language.clone(),
+                    path: path.clone(),
+                    body: None,
+                },
+                flags,
+                column: row.get(5)?,
+                blob_id,
+                start_line: row.get(6)?,
+            })
+        })?;
+        for row in in_file {
+            let row = row?;
+            if keep(&row) {
+                found.push(row);
+            }
+            if found.len() == rows {
+                return Ok(found);
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// Splits `Container.name` or `Container::name` into its container and name.
@@ -160,6 +245,27 @@ pub(crate) fn split_qualified(query: &str) -> (Option<&str>, &str) {
         }
         _ => (None, text),
     }
+}
+
+/// A constructor shares its type's name, so a query for the type finds both; the type's row
+/// already spans the constructor. A constructor without its type on the list stays.
+fn drop_constructors_beside_their_type(rows: &mut Vec<Row>) {
+    let types: HashSet<(&str, &str)> = rows
+        .iter()
+        .filter(|row| row.hit.kind.is_type_like())
+        .map(|row| (row.hit.path.as_str(), row.hit.name.as_str()))
+        .collect();
+    let keep: Vec<bool> = rows
+        .iter()
+        .map(|row| {
+            let hit = &row.hit;
+            let constructor =
+                hit.kind == SymbolKind::Method && hit.container.as_deref() == Some(&hit.name);
+            !constructor || !types.contains(&(hit.path.as_str(), hit.name.as_str()))
+        })
+        .collect();
+    let mut keep = keep.into_iter();
+    rows.retain(|_| keep.next().unwrap_or(true));
 }
 
 /// Keeps the rows defined in `container`. When none are, returns up to 5 other containers that
@@ -186,39 +292,31 @@ fn keep_in_container(rows: &mut Vec<Row>, name: &str, container: &str) -> Vec<St
     others
 }
 
-/// Fills each row's body. The stored row knows only its name line, so each file is parsed again
-/// to find where the definition's decorators, attributes, and doc comments start.
-fn add_bodies<'row>(opened: &Opened, rows: impl Iterator<Item = &'row mut Ranked>) -> Result<()> {
-    let mut rows_of: HashMap<i64, Vec<&mut Ranked>> = HashMap::new();
+/// Fills each row's signature, and with `body` its body from the stored start line, reading each
+/// file once.
+fn add_text<'row>(
+    opened: &Opened,
+    rows: impl Iterator<Item = &'row mut Row>,
+    body: bool,
+) -> Result<()> {
+    let mut rows_of: HashMap<i64, Vec<&mut Row>> = HashMap::new();
     for row in rows {
         rows_of.entry(row.blob_id).or_default().push(row);
     }
     for (blob_id, rows) in rows_of {
         let text = shard::blob_text(&opened.conn, blob_id)?;
-        let lines = Lines::new(&text);
-        let language = rows[0]
-            .hit
-            .language
-            .as_deref()
-            .and_then(Language::from_name);
-        let start_lines: HashMap<(u32, u32), u32> = language
-            .map(|language| extract(language, &text).symbols)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|symbol| ((symbol.line, symbol.col), symbol.start_line))
-            .collect();
+        let lines: Vec<&str> = text.lines().collect();
         for row in rows {
-            let hit = &mut row.hit;
-            // A parse that runs out of time finds nothing; the body then starts at the name.
-            let first = start_lines
-                .get(&(hit.line, row.column))
-                .copied()
-                .unwrap_or(hit.line);
-            let last = hit.end_line.min(first + MAX_BODY_LINES - 1);
+            row.hit.signature = signature(&lines, row.hit.line);
+            if !body {
+                continue;
+            }
+            let first = row.start_line;
+            let last = row.hit.end_line.min(first + MAX_BODY_LINES - 1);
             let text = (first..=last)
-                .map(|line| truncate_chars(lines.get(line as usize), MAX_LINE_CHARS))
+                .map(|line| truncate_chars(line_at(&lines, line), MAX_LINE_CHARS))
                 .collect();
-            hit.body = Some(Body { line: first, text });
+            row.hit.body = Some(Body { line: first, text });
         }
     }
     Ok(())
@@ -274,6 +372,7 @@ fn starts_a_word(name: &str, query: &str) -> bool {
 struct Row {
     hit: SymbolHit,
     column: u32,
+    start_line: u32,
     flags: u8,
     blob_id: i64,
 }
@@ -287,13 +386,14 @@ fn candidates(conn: &Connection, name: &str) -> Result<Vec<Row>> {
     sources
         .push("SELECT id FROM names WHERE name COLLATE NOCASE >= ?2 AND name COLLATE NOCASE < ?3");
     sources.push("SELECT id FROM names WHERE initials >= ?4 AND initials < ?5");
+    // CROSS JOIN keeps this order: sampled statistics can make SQLite scan every file instead.
     let sql = format!(
         "WITH candidates(id) AS ({})
-         SELECT n.name, s.kind, s.container, s.line, s.end_line, s.signature, b.language, f.path, f.flags, s.col, s.blob_id
-         FROM candidates c JOIN names n ON n.id = c.id
-         JOIN symbols s ON s.name_id = n.id
-         JOIN blobs b ON b.id = s.blob_id
-         JOIN files f ON f.blob_id = s.blob_id",
+         SELECT n.name, s.kind, s.container, s.line, s.end_line, b.language, f.path, f.flags, s.col, s.blob_id, s.start_line
+         FROM candidates c CROSS JOIN names n ON n.id = c.id
+         CROSS JOIN symbols s ON s.name_id = n.id
+         CROSS JOIN blobs b ON b.id = s.blob_id
+         CROSS JOIN files f ON f.blob_id = s.blob_id",
         sources.join(" UNION ")
     );
     let lowered = name.to_lowercase();
@@ -310,14 +410,15 @@ fn candidates(conn: &Connection, name: &str) -> Result<Vec<Row>> {
                     container: row.get(2)?,
                     line: row.get(3)?,
                     end_line: row.get(4)?,
-                    signature: row.get(5)?,
-                    language: row.get(6)?,
-                    path: row.get(7)?,
+                    signature: String::new(),
+                    language: row.get(5)?,
+                    path: row.get(6)?,
                     body: None,
                 },
-                flags: row.get(8)?,
-                column: row.get(9)?,
-                blob_id: row.get(10)?,
+                flags: row.get(7)?,
+                column: row.get(8)?,
+                blob_id: row.get(9)?,
+                start_line: row.get(10)?,
             })
         },
     )?;

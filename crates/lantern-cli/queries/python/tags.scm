@@ -12,3 +12,7 @@
       (attribute
         attribute: (identifier) @name)
   ]) @reference.call
+
+; base classes
+(class_definition
+  superclasses: (argument_list [(identifier) @name (attribute attribute: (identifier) @name)])) @reference.implementation

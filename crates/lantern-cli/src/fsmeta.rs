@@ -45,6 +45,12 @@ impl Stat {
         }
     }
 
+    /// A file whose metadata access was denied. It equals no real stat, so a refresh reads the
+    /// file again once access returns.
+    pub fn denied_file() -> Self {
+        Self::other(EntryKind::File)
+    }
+
     /// The later of the modification and change times, in milliseconds since the Unix epoch.
     pub fn last_change_ms(&self) -> i64 {
         let latest = self.modified.max(self.changed);
@@ -58,12 +64,25 @@ impl Stat {
     }
 }
 
+/// Out of memory or file handles: a fault of this process, not of the file, so it must not mark
+/// files unreadable.
+pub(crate) fn is_exhausted(error: &io::Error) -> bool {
+    // ENFILE and EMFILE; ERROR_TOO_MANY_OPEN_FILES.
+    let out_of_handles: &[i32] = if cfg!(windows) { &[4] } else { &[23, 24] };
+    error.kind() == io::ErrorKind::OutOfMemory
+        || error
+            .raw_os_error()
+            .is_some_and(|code| out_of_handles.contains(&code))
+}
+
 /// The content of a regular file after a stable read.
 #[derive(Debug)]
 pub(crate) enum Content {
     Text(Vec<u8>),
     Binary,
     TooLarge,
+    /// Access denied, or locked by another process.
+    Unreadable,
 }
 
 /// Reads `path` and proves it matched `expected` before open, at open, after read, and after close.
@@ -83,14 +102,16 @@ pub(crate) fn read_stable(path: &Path, expected: &Stat, max_size: u64) -> Result
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(changed()),
-        Err(error) => return Err(Error::io(path, &error)),
+        Err(error) if is_exhausted(&error) => return Err(Error::io(path, &error)),
+        Err(_) => return Ok(Content::Unreadable),
     };
     check(fstat(&file))?;
     let mut bytes = Vec::with_capacity(usize::try_from(expected.size).unwrap_or(0) + 1);
-    (&file)
-        .take(expected.size + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| Error::io(path, &error))?;
+    match (&file).take(expected.size + 1).read_to_end(&mut bytes) {
+        Ok(_) => {}
+        Err(error) if is_exhausted(&error) => return Err(Error::io(path, &error)),
+        Err(_) => return Ok(Content::Unreadable),
+    }
     check(fstat(&file))?;
     drop(file);
     check(lstat(path))?;
@@ -241,12 +262,12 @@ pub(crate) fn list_dir(dir: &Path) -> io::Result<Vec<Listed>> {
                 handle.as_raw_handle(),
                 class,
                 buffer.as_mut_ptr().cast(),
-                (BUFFER_WORDS * size_of::<u64>()) as u32,
+                win32_len(BUFFER_WORDS * size_of::<u64>())?,
             )
         };
         if ok == 0 {
             let error = io::Error::last_os_error();
-            let code = error.raw_os_error().map(|code| code as u32);
+            let code = error.raw_os_error().map(i32::cast_unsigned);
             if code == Some(ERROR_NO_MORE_FILES) {
                 return Ok(listed);
             }
@@ -285,8 +306,8 @@ pub(crate) fn list_dir(dir: &Path) -> io::Result<Vec<Listed>> {
                     Ok(Stat {
                         kind: EntryKind::File,
                         device,
-                        inode: info.FileId as u64,
-                        size: info.EndOfFile as u64,
+                        inode: info.FileId.cast_unsigned(),
+                        size: info.EndOfFile.cast_unsigned(),
                         modified: info.LastWriteTime,
                         changed: info.ChangeTime,
                     })
@@ -323,13 +344,18 @@ fn is_name_surrogate(file: &File) -> io::Result<bool> {
             file.as_raw_handle(),
             FileAttributeTagInfo,
             (&raw mut tag).cast(),
-            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+            win32_len(size_of::<FILE_ATTRIBUTE_TAG_INFO>())?,
         )
     };
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(tag.ReparseTag & NAME_SURROGATE_BIT != 0)
+}
+
+#[cfg(windows)]
+fn win32_len(bytes: usize) -> io::Result<u32> {
+    u32::try_from(bytes).map_err(io::Error::other)
 }
 
 /// The stat of an open handle, and its file attributes.
@@ -347,7 +373,7 @@ fn handle_stat(file: &File) -> io::Result<(Stat, u32)> {
     let (mut info, mut basic): (BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO) =
         unsafe { (zeroed(), zeroed()) };
     // SAFETY: `handle` is open for the lifetime of `file`, and `info` is a valid out-pointer.
-    if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
+    if unsafe { GetFileInformationByHandle(handle, &raw mut info) } == 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: `basic` is a valid out-pointer of the size passed for the `FileBasicInfo` class.
@@ -356,7 +382,7 @@ fn handle_stat(file: &File) -> io::Result<(Stat, u32)> {
             handle,
             FileBasicInfo,
             (&raw mut basic).cast(),
-            size_of::<FILE_BASIC_INFO>() as u32,
+            win32_len(size_of::<FILE_BASIC_INFO>())?,
         )
     };
     if ok == 0 {

@@ -59,3 +59,10 @@
 
 
 ; Lantern: bare identifiers need local-variable scoping, which Lantern does not run, so they are not captured.
+
+; constants
+
+(assignment left: (constant) @name) @definition.constant
+
+; superclasses
+(superclass [(constant) @name (scope_resolution name: (constant) @name)]) @reference.implementation

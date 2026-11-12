@@ -12,42 +12,28 @@ use tree_sitter::{
 };
 
 use crate::language::Language;
-use crate::limits::{MAX_SIGNATURE_CHARS, MIN_PARSE_BUDGET, PARSE_BUDGET_PER_MIB};
+use crate::limits::{MIN_PARSE_BUDGET, PARSE_BUDGET_PER_MIB};
 
-/// The normalized kind of a definition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+/// The normalized kind of a definition. The shard stores these numbers; a new number needs a
+/// schema version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum SymbolKind {
-    Function,
-    Method,
-    Class,
-    Interface,
-    Struct,
-    Enum,
-    Trait,
-    Type,
-    Module,
-    Constant,
-    Variable,
-    Field,
+    Function = 0,
+    Method = 1,
+    Class = 2,
+    Interface = 3,
+    Struct = 4,
+    Enum = 5,
+    Trait = 6,
+    Type = 7,
+    Module = 8,
+    Constant = 9,
+    Variable = 10,
+    Field = 11,
 }
 
 impl SymbolKind {
-    const ALL: [Self; 12] = [
-        Self::Function,
-        Self::Method,
-        Self::Class,
-        Self::Interface,
-        Self::Struct,
-        Self::Enum,
-        Self::Trait,
-        Self::Type,
-        Self::Module,
-        Self::Constant,
-        Self::Variable,
-        Self::Field,
-    ];
-
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -68,7 +54,7 @@ impl SymbolKind {
 
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|kind| kind.as_str() == name)
+        <Self as clap::ValueEnum>::from_str(name, false).ok()
     }
 
     /// Types and functions rank before variables and fields.
@@ -87,26 +73,15 @@ impl SymbolKind {
         }
     }
 
+    /// A tag query's `@definition.<suffix>`; the stock queries also tag macros.
     fn from_capture(suffix: &str) -> Option<Self> {
-        let kind = match suffix {
-            "function" | "macro" => Self::Function,
-            "method" => Self::Method,
-            "class" => Self::Class,
-            "interface" => Self::Interface,
-            "struct" => Self::Struct,
-            "enum" => Self::Enum,
-            "trait" => Self::Trait,
-            "type" => Self::Type,
-            "module" => Self::Module,
-            "constant" => Self::Constant,
-            "variable" => Self::Variable,
-            "field" => Self::Field,
-            _ => return None,
-        };
-        Some(kind)
+        if suffix == "macro" {
+            return Some(Self::Function);
+        }
+        Self::from_name(suffix)
     }
 
-    fn is_type_like(self) -> bool {
+    pub(crate) fn is_type_like(self) -> bool {
         matches!(
             self,
             Self::Class | Self::Interface | Self::Struct | Self::Enum | Self::Trait | Self::Type
@@ -114,19 +89,18 @@ impl SymbolKind {
     }
 }
 
-/// The kind of a reference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+/// The kind of a reference. The shard stores these numbers; a new number needs a schema
+/// version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum RefKind {
-    Call,
-    Type,
-    Import,
-    Implementation,
+    Call = 0,
+    Type = 1,
+    Import = 2,
+    Implementation = 3,
 }
 
 impl RefKind {
-    const ALL: [Self; 4] = [Self::Call, Self::Type, Self::Import, Self::Implementation];
-
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -135,11 +109,6 @@ impl RefKind {
             Self::Import => "import",
             Self::Implementation => "implementation",
         }
-    }
-
-    #[must_use]
-    pub fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|kind| kind.as_str() == name)
     }
 
     fn from_capture(suffix: &str) -> Option<Self> {
@@ -162,10 +131,8 @@ pub(crate) struct Symbol {
     pub line: u32,
     pub col: u32,
     pub end_line: u32,
-    /// The first line with the decorators, attributes, and doc comments of the definition; not
-    /// stored, only `symbols --body` reads it.
+    /// The first line with the decorators, attributes, and doc comments of the definition.
     pub start_line: u32,
-    pub signature: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,8 +178,9 @@ pub(crate) fn extractor_version() -> String {
 
 /// Parses `source` and returns its definitions and references.
 pub(crate) fn extract(language: Language, source: &str) -> Extraction {
+    let bytes = f64::from(u32::try_from(source.len()).unwrap_or(u32::MAX));
     let budget = PARSE_BUDGET_PER_MIB
-        .mul_f64(source.len() as f64 / f64::from(1u32 << 20))
+        .mul_f64(bytes / f64::from(1u32 << 20))
         .max(MIN_PARSE_BUDGET);
     let query = query(language);
     let deadline = Instant::now() + budget;
@@ -429,7 +397,7 @@ impl Tags {
             return;
         }
         let start = name.start_position();
-        let (line, col) = (start.row as u32 + 1, start.column as u32 + 1);
+        let (line, col) = (one_based(start.row), one_based(start.column));
         match role {
             Role::Definition(kind) => {
                 let node = definition_node(node);
@@ -458,7 +426,8 @@ impl Tags {
         }
     }
 
-    fn finish(mut self, source: &str) -> Extraction {
+    /// Keeps one capture per name, and drops references that are the name of a definition.
+    fn dedup(&mut self) {
         // One definition per name; a capture with a container beats the generic capture.
         self.definitions
             .sort_by_key(|definition| (definition.name.start, definition.container.is_none()));
@@ -479,7 +448,10 @@ impl Tags {
                 .binary_search_by_key(&reference.name.start, |name| name.start)
                 .is_err()
         });
+    }
 
+    fn finish(mut self, source: &str) -> Extraction {
+        self.dedup();
         self.definitions.sort_by_key(|definition| {
             (
                 definition.node.start,
@@ -527,7 +499,6 @@ impl Tags {
                 col: definition.col,
                 end_line: definition.end_line.max(definition.line),
                 start_line: definition.start_line,
-                signature: signature(source, definition.name.start),
             });
             open.push(symbols.len() - 1);
         }
@@ -609,13 +580,15 @@ fn lead_start_line(node: Node<'_>) -> u32 {
         }
         first = previous;
     }
-    first.start_position().row as u32 + 1
+    one_based(first.start_position().row)
 }
 
 fn is_lead(kind: &str) -> bool {
-    ["comment", "attribute", "decorator", "annotation"]
-        .iter()
-        .any(|lead| kind.contains(lead))
+    // Java's `annotation_type_declaration` is a definition of its own, not a lead.
+    !kind.ends_with("_declaration")
+        && ["comment", "attribute", "decorator", "annotation"]
+            .iter()
+            .any(|lead| kind.contains(lead))
 }
 
 fn refine(kind: SymbolKind, node: Node<'_>) -> SymbolKind {
@@ -650,15 +623,12 @@ fn end_line(node: Node<'_>) -> u32 {
     } else {
         end.row
     };
-    row as u32 + 1
+    one_based(row)
 }
 
-fn signature(source: &str, at: usize) -> String {
-    let start = source[..at].rfind('\n').map_or(0, |index| index + 1);
-    let end = source[at..]
-        .find('\n')
-        .map_or(source.len(), |index| at + index);
-    truncate_chars(source[start..end].trim(), MAX_SIGNATURE_CHARS)
+/// Tree-sitter keeps rows and columns as 32-bit values, so this never saturates in practice.
+fn one_based(position: usize) -> u32 {
+    u32::try_from(position + 1).unwrap_or(u32::MAX)
 }
 
 pub(crate) fn truncate_chars(text: &str, max: usize) -> String {
@@ -670,14 +640,38 @@ pub(crate) fn truncate_chars(text: &str, max: usize) -> String {
 
 impl rusqlite::types::FromSql for SymbolKind {
     fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
-        crate::store::column_name(value, "symbol kind", Self::from_name)
+        stored_kind(value, |kind: Self| kind as i64)
+    }
+}
+
+impl rusqlite::types::ToSql for SymbolKind {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok((*self as i64).into())
     }
 }
 
 impl rusqlite::types::FromSql for RefKind {
     fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
-        crate::store::column_name(value, "reference kind", Self::from_name)
+        stored_kind(value, |kind: Self| kind as i64)
     }
+}
+
+impl rusqlite::types::ToSql for RefKind {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok((*self as i64).into())
+    }
+}
+
+fn stored_kind<Kind: clap::ValueEnum + Copy>(
+    value: rusqlite::types::ValueRef<'_>,
+    number: impl Fn(Kind) -> i64,
+) -> rusqlite::types::FromSqlResult<Kind> {
+    let stored = value.as_i64()?;
+    Kind::value_variants()
+        .iter()
+        .copied()
+        .find(|&kind| number(kind) == stored)
+        .ok_or(rusqlite::types::FromSqlError::OutOfRange(stored))
 }
 
 #[cfg(test)]
@@ -795,8 +789,150 @@ mod tests {
     }
 
     #[test]
+    fn base_types_are_implementations_in_every_class_language() {
+        let cases = [
+            (
+                Language::CSharp,
+                "class A : Base, IShow {}\ninterface IShow : IBase {}\n",
+                &["Base", "IShow", "IBase"][..],
+            ),
+            (
+                Language::Java,
+                "class A extends Base implements IShow {}\n",
+                &["Base", "IShow"][..],
+            ),
+            (
+                Language::Php,
+                "<?php\nclass A extends Base implements IShow {}\nclass B extends \\App\\Core {}\n",
+                &["Base", "IShow", "Core"][..],
+            ),
+            (
+                Language::Cpp,
+                "class A : public Base, private ns::Core {};\n",
+                &["Base", "Core"][..],
+            ),
+            (
+                Language::Python,
+                "class A(Base, mod.Core):\n    pass\n",
+                &["Base", "Core"][..],
+            ),
+            (
+                Language::Ruby,
+                "class A < Base\nend\nclass B < Mod::Core\nend\n",
+                &["Base", "Core"][..],
+            ),
+        ];
+        for (language, source, expected) in cases {
+            let found: Vec<String> = references(language, source)
+                .into_iter()
+                .filter(|row| row.1 == "implementation")
+                .map(|row| row.0)
+                .collect();
+            assert_eq!(found, expected, "{language:?}");
+        }
+    }
+
+    #[test]
+    fn constants_are_definitions_in_every_language() {
+        type Case = (
+            Language,
+            &'static str,
+            &'static [(&'static str, &'static str)],
+        );
+        let cases: [Case; 10] = [
+            (
+                Language::C,
+                "#define GUARD_H\n#define MAX 1\nconst int LIMIT = 2;\nint plain = 3;\nenum E { RED };\n",
+                &[
+                    ("MAX", "constant"),
+                    ("LIMIT", "constant"),
+                    ("RED", "constant"),
+                ],
+            ),
+            (
+                Language::Cpp,
+                "constexpr int N = 1;\nnamespace ns { const int IN = 2; }\nclass B { static const int SIZE = 3; int field; };\n",
+                &[("N", "constant"), ("IN", "constant"), ("SIZE", "constant")],
+            ),
+            (
+                Language::CSharp,
+                "class C { const int Max = 1; static readonly int Limit = 2; public static readonly int Shared = 3; readonly int late; int field; }\nenum E { Red }\n",
+                &[
+                    ("Max", "constant"),
+                    ("Limit", "constant"),
+                    ("Shared", "constant"),
+                    ("Red", "constant"),
+                ],
+            ),
+            (
+                Language::Dart,
+                "const max = 1;\nconst int typed = 2;\nfinal later = 3;\nvar plain = 4;\nclass K { static const size = 5; final field = 6; }\n",
+                &[
+                    ("max", "constant"),
+                    ("typed", "constant"),
+                    ("later", "variable"),
+                    ("plain", "variable"),
+                    ("size", "constant"),
+                ],
+            ),
+            (
+                Language::Go,
+                "package p\nconst (\n\tA = iota\n\tB\n)\nvar ErrX = 1\nfunc f() { const local = 1 }\n",
+                &[("A", "constant"), ("B", "constant"), ("ErrX", "variable")],
+            ),
+            (
+                Language::JavaScript,
+                "const MAX = 1;\nexport const LIMIT = {};\nlet plain = 2;\nconst run = () => 1;\nfunction f() { const local = 1; }\n",
+                &[("MAX", "constant"), ("LIMIT", "constant")],
+            ),
+            (
+                Language::Php,
+                "<?php\nconst MAX = 1;\ndefine('LIMIT', 2);\nclass C { const SIZE = 3; }\nenum E { case Red; }\n",
+                &[
+                    ("MAX", "constant"),
+                    ("LIMIT", "constant"),
+                    ("SIZE", "constant"),
+                    ("Red", "constant"),
+                ],
+            ),
+            (
+                Language::Ruby,
+                "MAX = 1\nmodule M\n  INNER = 2\nend\nplain = 3\n",
+                &[("MAX", "constant"), ("INNER", "constant")],
+            ),
+            (
+                Language::TypeScript,
+                "const MAX = 1;\nexport const LIMIT = 2 as const;\nenum E { Red, Green = 2 }\n",
+                &[
+                    ("MAX", "constant"),
+                    ("LIMIT", "constant"),
+                    ("Red", "constant"),
+                    ("Green", "constant"),
+                ],
+            ),
+            (
+                Language::Tsx,
+                "const MAX = 1;\nconst View = () => <div />;\n",
+                &[("MAX", "constant")],
+            ),
+        ];
+        for (language, source, expected) in cases {
+            let found: Vec<(String, &str)> = definitions(language, source)
+                .into_iter()
+                .filter(|row| matches!(row.1, "constant" | "variable"))
+                .map(|row| (row.0, row.1))
+                .collect();
+            let expected: Vec<(String, &str)> = expected
+                .iter()
+                .map(|&(name, kind)| (name.to_owned(), kind))
+                .collect();
+            assert_eq!(found, expected, "{language:?}");
+        }
+    }
+
+    #[test]
     fn rust_items_get_precise_kinds() {
-        let source = "struct Point { x: i32 }\nenum Shape { A }\ntrait Draw { fn draw(&self); }\nimpl Point {\n    fn new() -> Self { util::make::<i32>(); Self::origin() }\n}\nmod util {\n    fn make() {}\n}\n";
+        let source = "struct Point { x: i32 }\nenum Shape { A }\ntrait Draw { fn draw(&self); }\nimpl Point {\n    fn new() -> Self { util::make::<i32>(); Self::origin() }\n}\nmod util {\n    fn make() {}\n}\nconst MAX: u32 = 1;\nstatic NAME: &str = \"n\";\nimpl Shape {\n    const ZERO: i32 = 0;\n}\n";
         let rows = definitions(Language::Rust, source);
         let kinds: Vec<(&str, &str)> = rows.iter().map(|row| (row.0.as_str(), row.1)).collect();
         assert_eq!(
@@ -808,8 +944,12 @@ mod tests {
                 ("new", "method"),
                 ("util", "module"),
                 ("make", "function"),
+                ("MAX", "constant"),
+                ("NAME", "constant"),
+                ("ZERO", "constant"),
             ]
         );
+        assert_eq!(rows[8].2.as_deref(), Some("Shape"));
         assert_eq!(rows[3].2.as_deref(), Some("Point"));
         assert_eq!(rows[5].2.as_deref(), Some("util"));
         assert_eq!(
@@ -818,6 +958,7 @@ mod tests {
                 ("Point".to_owned(), "implementation", None),
                 ("make".to_owned(), "call", Some("new".to_owned())),
                 ("origin".to_owned(), "call", Some("new".to_owned())),
+                ("Shape".to_owned(), "implementation", None),
             ]
         );
     }
@@ -877,6 +1018,44 @@ mod tests {
         );
         let refs = references(Language::Go, source);
         assert!(refs.contains(&("run".to_owned(), "call", Some("Start".to_owned()))));
+    }
+
+    #[test]
+    fn java_records_annotations_constructors_and_constants() {
+        let source = "\
+public @interface AuthCheck {
+  boolean permissionCheck() default true;
+}
+record Point(int x, int y) {
+  Point {}
+  int sum() { return x + y; }
+}
+class Svc {
+  static final String URL = \"x\", NAME = \"y\";
+  private final OrderService orderService;
+  Svc() {}
+}
+interface Limits { int MAX = 3; }
+enum Color { RED }
+";
+        assert_eq!(
+            definitions(Language::Java, source),
+            owned(&[
+                ("AuthCheck", "interface", None, 1, 3),
+                ("permissionCheck", "method", Some("AuthCheck"), 2, 2),
+                ("Point", "class", None, 4, 7),
+                ("Point", "method", Some("Point"), 5, 5),
+                ("sum", "method", Some("Point"), 6, 6),
+                ("Svc", "class", None, 8, 12),
+                ("URL", "constant", Some("Svc"), 9, 9),
+                ("NAME", "constant", Some("Svc"), 9, 9),
+                ("Svc", "method", Some("Svc"), 11, 11),
+                ("Limits", "interface", None, 13, 13),
+                ("MAX", "constant", Some("Limits"), 13, 13),
+                ("Color", "enum", None, 14, 14),
+                ("RED", "constant", Some("Color"), 14, 14),
+            ])
+        );
     }
 
     #[test]
@@ -952,7 +1131,7 @@ class Alias = Shop with Walks;
                 ("Shop", "class", None, 8, 26),
                 ("size", "field", shop, 9, 9),
                 ("weight", "field", shop, 9, 9),
-                ("tag", "field", shop, 10, 10),
+                ("tag", "constant", shop, 10, 10),
                 ("Shop", "method", shop, 11, 11),
                 ("named", "method", shop, 12, 14),
                 ("c", "method", shop, 15, 15),
@@ -1053,6 +1232,16 @@ function App() {
         };
         let java = "class A {\n  int x; // trailing\n  /** Doc. */\n  @Override\n  @GetMapping(\n      \"/x\")\n  public void run() {\n  }\n}\n";
         assert_eq!(start_of(Language::Java, java, "run"), Some((3, 7)));
+        let annotation_type =
+            "@interface Auth {\n  String name();\n  int level();\n}\nclass Bar {\n}\n";
+        assert_eq!(
+            start_of(Language::Java, annotation_type, "level"),
+            Some((3, 3))
+        );
+        assert_eq!(
+            start_of(Language::Java, annotation_type, "Bar"),
+            Some((5, 5))
+        );
         let rust = "use x;\n\n/// Doc.\n#[test] #[ignore]\nfn run() {\n}\n";
         assert_eq!(start_of(Language::Rust, rust, "run"), Some((3, 5)));
         let python = "# Not attached.\n\n@app.route(\"/x\")\ndef run():\n    pass\n";
