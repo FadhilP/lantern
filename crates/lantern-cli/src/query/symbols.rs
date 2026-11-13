@@ -253,6 +253,11 @@ pub(crate) fn split_qualified(query: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// True when no container is wanted, or `found` is the wanted one, ignoring ASCII case.
+pub(crate) fn container_matches(wanted: Option<&str>, found: Option<&str>) -> bool {
+    wanted.is_none_or(|wanted| found.is_some_and(|found| wanted.eq_ignore_ascii_case(found)))
+}
+
 /// A constructor shares its type's name, so a query for the type finds both; the type's row
 /// already spans the constructor. A constructor without its type on the list stays.
 fn drop_constructors_beside_their_type(rows: &mut Vec<Row>) {
@@ -277,12 +282,7 @@ fn drop_constructors_beside_their_type(rows: &mut Vec<Row>) {
 /// Keeps the rows defined in `container`. When none are, returns up to 5 other containers that
 /// define `name`, so a wrong guess of the container gets a direction.
 fn keep_in_container(rows: &mut Vec<Row>, name: &str, container: &str) -> Vec<String> {
-    let in_container = |row: &Row| {
-        row.hit
-            .container
-            .as_deref()
-            .is_some_and(|found| found.eq_ignore_ascii_case(container))
-    };
+    let in_container = |row: &Row| container_matches(Some(container), row.hit.container.as_deref());
     let mut others: Vec<String> = Vec::new();
     if !rows.iter().any(in_container) {
         others = rows

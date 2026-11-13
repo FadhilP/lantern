@@ -140,3 +140,24 @@ pub(crate) fn schema_version(path: &Path) -> Result<i64> {
 fn user_version(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
 }
+
+fn put_varint(bytes: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        bytes.push((value as u8 & 0x7F) | 0x80);
+        value >>= 7;
+    }
+    bytes.push(value as u8);
+}
+
+fn take_varint(bytes: &[u8], at: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let byte = *bytes.get(*at)?;
+        *at += 1;
+        value |= u64::from(byte & 0x7F) << shift;
+        if byte < 0x80 {
+            return Some(value);
+        }
+    }
+    None
+}

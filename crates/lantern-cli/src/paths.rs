@@ -46,11 +46,7 @@ pub(crate) fn join(prefix: &str, path: &str) -> String {
 
 /// True when `path` is `dir` or lies below it. An empty `dir` contains everything.
 pub(crate) fn is_within(path: &str, dir: &str) -> bool {
-    dir.is_empty()
-        || path == dir
-        || path
-            .strip_prefix(dir)
-            .is_some_and(|rest| rest.starts_with('/'))
+    strip_dir(path, dir).is_some()
 }
 
 /// `path` relative to `dir` when it lies within it.

@@ -47,12 +47,9 @@ impl Home {
         self.dir.join("roots")
     }
 
-    pub fn shard_name(root_key: &str) -> String {
-        format!("{}.sqlite", paths::key_hash(root_key))
-    }
-
     pub fn shard_path(&self, root_key: &str) -> PathBuf {
-        self.roots_dir().join(Self::shard_name(root_key))
+        self.roots_dir()
+            .join(format!("{}.sqlite", paths::key_hash(root_key)))
     }
 
     /// The key hash in the name of a shard file or its WAL, shared-memory, or staging file.

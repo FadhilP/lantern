@@ -4,7 +4,7 @@
 use std::io::Write;
 
 use crate::changes::{ChangedFile, ChangedLine, Move, SymbolStatus, Unparsed};
-use crate::error::{Error, ErrorKind};
+use crate::error::Error;
 use crate::extract::SymbolKind;
 use crate::git::FileStatus;
 use crate::query::Page;
@@ -171,13 +171,10 @@ fn fit(
         }
     }
     if low == 0 && total > 0 {
-        return Err(Error::new(
-            ErrorKind::Usage,
-            format!(
-                "--max-bytes {max_bytes} is smaller than one result, which needs {} bytes",
-                render(1).len()
-            ),
-        ));
+        return Err(Error::usage(format!(
+            "--max-bytes {max_bytes} is smaller than one result, which needs {} bytes",
+            render(1).len()
+        )));
     }
     Ok(render(low))
 }

@@ -681,7 +681,7 @@ impl Job<'_> {
                 });
             }
         };
-        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let text = String::from_utf8_lossy(&bytes);
         let language = Language::detect(path, &text);
         let key = blob_key(language, &bytes);
         if let Some(&blob_id) = keys.get(&key) {
@@ -833,7 +833,6 @@ fn reextract_blobs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::language::FileFlags;
 
     #[test]
     fn a_file_changed_near_the_last_scan_is_read_again() {

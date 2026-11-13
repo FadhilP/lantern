@@ -15,7 +15,7 @@ use crate::git::{self, FileDiff, FileStatus, Line, Side};
 use crate::language::Language;
 use crate::limits::TEXT_SNIFF_BYTES;
 use crate::paths;
-use crate::query::symbols::split_qualified;
+use crate::query::symbols::{container_matches, split_qualified};
 use crate::query::{self, Page, PageRequest, PathFilter};
 
 #[derive(Debug, Clone)]
@@ -457,12 +457,7 @@ impl Reader<'_> {
         let Some((container, name)) = self.name else {
             return true;
         };
-        let container_matches = match (container, symbol.container.as_deref()) {
-            (None, _) => true,
-            (Some(wanted), Some(found)) => wanted.eq_ignore_ascii_case(found),
-            (Some(_), None) => false,
-        };
-        symbol.name == name && container_matches
+        symbol.name == name && container_matches(container, symbol.container.as_deref())
     }
 
     fn changed_symbol(
@@ -650,14 +645,10 @@ impl<'a> View<'a> {
         let whole: Vec<bool> = symbols
             .iter()
             .map(|symbol| {
-                let mut lines =
-                    (symbol.start_line..=symbol.end_line).filter(|&line| !is_filler(&text, line));
-                let mut any = false;
-                let all = lines.all(|line| {
-                    any = true;
-                    changed.contains(&line)
-                });
-                any && all
+                let mut lines = (symbol.start_line..=symbol.end_line)
+                    .filter(|&line| !is_filler(&text, line))
+                    .peekable();
+                lines.peek().is_some() && lines.all(|line| changed.contains(&line))
             })
             .collect();
         let mut seen: HashMap<(Option<&str>, &str, SymbolKind), usize> = HashMap::new();

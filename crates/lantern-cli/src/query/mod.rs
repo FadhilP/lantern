@@ -126,10 +126,6 @@ impl Opened {
         paths::is_within(path, &self.scope) && filter.matches(path)
     }
 
-    fn start(&self, query: &str, request: &PageRequest) -> Result<CursorBase> {
-        start(&self.state, query, request)
-    }
-
     /// Why an empty result may be empty.
     pub fn incomplete(&self, filter: &PathFilter) -> Result<shard::Incomplete> {
         let mut incomplete = shard::incomplete(&self.conn)?;
@@ -167,7 +163,7 @@ impl Opened {
 
     /// Which sorted rows a page needs.
     pub fn needed(&self, query: &str, request: &PageRequest) -> Result<Needed> {
-        let offset = self.start(query, request)?.offset;
+        let offset = start(&self.state, query, request)?.offset;
         Ok(Needed {
             offset,
             rows: offset + request.limit + 1,

@@ -125,13 +125,7 @@ pub(crate) fn generated_rules(attributes: &str) -> String {
         let Some(pattern) = words.next() else {
             continue;
         };
-        let mut state = None;
-        for word in words {
-            if let Some(set) = linguist_state(word) {
-                state = Some(set);
-            }
-        }
-        match state {
+        match words.filter_map(linguist_state).next_back() {
             Some(true) => out.push_str(pattern),
             Some(false) => {
                 out.push('!');

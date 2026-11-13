@@ -6,13 +6,12 @@ use clap::ValueEnum;
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 
-use super::{Opened, PathFilter, validate_text};
+use super::symbols::{container_matches, split_qualified};
+use super::{Freshness, Opened, PathFilter, validate_text};
 use crate::error::{Error, Result};
 use crate::extract::{RefKind, SymbolKind};
 use crate::language::FileFlags;
 use crate::limits::{MAX_GRAPH_DEPTH, MAX_GRAPH_NODES};
-use crate::query::Freshness;
-use crate::query::symbols::split_qualified;
 use crate::store::{refs, shard};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
@@ -148,20 +147,12 @@ pub(crate) fn run(opened: &Opened, query: &GraphQuery) -> Result<Graph> {
         by_name: HashMap::new(),
     };
     let (container, name) = split_qualified(&query.name);
-    let in_container = |definition: &Definition| {
-        container.is_none_or(|container| {
-            definition
-                .container
-                .as_deref()
-                .is_some_and(|found| found.eq_ignore_ascii_case(container))
-        })
-    };
     let mut roots = Vec::new();
     for definition in builder.definitions_named(name)? {
         if !query.kind.is_empty() && !query.kind.contains(&definition.kind) {
             continue;
         }
-        if !in_container(&definition) {
+        if !container_matches(container, definition.container.as_deref()) {
             continue;
         }
         if let Some(id) = builder.node(&Vertex::Definition(definition)) {

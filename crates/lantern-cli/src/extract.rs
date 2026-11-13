@@ -509,13 +509,6 @@ impl Tags {
         for reference in &self.references {
             let at = reference.name.start;
             while next < self.definitions.len() && self.definitions[next].node.start <= at {
-                let start = self.definitions[next].node.start;
-                while open
-                    .last()
-                    .is_some_and(|&top| self.definitions[top].node.end <= start)
-                {
-                    open.pop();
-                }
                 open.push(next);
                 next += 1;
             }

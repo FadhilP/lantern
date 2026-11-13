@@ -1,5 +1,6 @@
 //! `outline`: what is in this file? Symbols nested by line range and by container.
 
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 
 use super::{Opened, Page, PageRequest, PathFilter, signature, validate_limit};
@@ -49,11 +50,7 @@ pub(crate) fn run(
             [&full],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .map(Some)
-        .or_else(|error| match error {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            other => Err(other),
-        })?;
+        .optional()?;
     let shown = paths::from_dir(&opened.scope, &full);
     let (blob_id, language) = match stored {
         Some((Some(blob_id), language, _)) => (blob_id, language),

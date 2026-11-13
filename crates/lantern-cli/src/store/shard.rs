@@ -553,18 +553,6 @@ pub struct Counts {
     pub unreadable_files: u64,
 }
 
-impl std::ops::AddAssign for Counts {
-    fn add_assign(&mut self, other: Self) {
-        self.files += other.files;
-        self.text_files += other.text_files;
-        self.code_files += other.code_files;
-        self.symbols += other.symbols;
-        self.refs += other.refs;
-        self.unparsed_files += other.unparsed_files;
-        self.unreadable_files += other.unreadable_files;
-    }
-}
-
 pub(crate) fn counts(conn: &Connection) -> Result<Counts> {
     Ok(conn.query_row(
         "SELECT (SELECT count(*) FROM files),
