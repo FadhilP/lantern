@@ -103,7 +103,7 @@ Line search. The pattern is a literal unless `--regex` is set (Rust `regex` synt
 - `--context N` adds up to N lines as `before` and `after` on each match. A value over 50 counts as 50. Windows of nearby matches do not overlap: a line is shown once, so `before` and `after` can be shorter than N.
 - `--sort relevance` (default) ranks files by the pattern's literals they hold, with generated files last: each literal a file holds adds up to 1, and each repeat adds less than the one before. `--sort path` orders by path.
 
-Row (one per file): `path, match_count, matches: [{line, column, text, before?, after?}]`. `column` is a 1-based byte column. Line text is cut at 200 characters in text output and at 500 in JSON, and a cut line ends with `…`. The same cap applies to `refs` text, `symbols` bodies, and signatures (at most 300). When a match starts too late to show, the match line starts with `…` and shows a window from a fifth of the cap (40 or 100 characters) before the match. Default limit 10 files.
+Row (one per file): `path, match_count, matches: [{line, column, text, before?, after?, enclosing?: {name, container?, kind}}]`. `column` is a 1-based byte column. Line text is cut at 200 characters in text output and at 500 in JSON, and a cut line ends with `…`. The same cap applies to `refs` text, `symbols` bodies, and signatures (at most 300). When a match starts too late to show, the match line starts with `…` and shows a window from a fifth of the cap (40 or 100 characters) before the match. Default limit 10 files.
 
 ### `refs <name>`
 
@@ -186,7 +186,7 @@ Errors go to stderr as `{"error":{"code":"...","message":"..."}}`, with the mess
 Without `--json`, list commands and `graph` print compact text for agents and people. Scripts should use `--json`; the text format can change. Each result line is one line: a control character other than tab inside it, such as a newline in a file name, prints escaped: `\n`, `\r`, `\u{1b}`.
 
 - `symbols`: `path:line-end_line kind[ in Container]: signature`, one per line. With `--body`, `line:text` lines follow, then `-- body cut: N more lines` when the body is longer than 100 lines.
-- `code`: a heading line with the file path (`path (N matches, M shown)` when `--per-file` cut matches; `path (N matches)` with `-l`), then `line:text` for each match and `line-text` for `--context` lines.
+- `code`: a heading line with the file path (`path (N matches, M shown)` when `--per-file` cut matches; `path (N matches)` with `-l`), then `line:text` for each match and `line-text` for `--context` lines. Where the innermost definition around the matches changes, an indented line right above the match names it: `  in kind Container.name`, or `  not in a named definition` after one ends (code in an anonymous function counts as outside). A definition's decorators and doc comments count as inside it. It names only the matches; `--context` lines can be in other definitions.
 - `refs`: a heading line with the file path, then `line:column kind[ in Container.name]: text` for each reference.
 - `outline`: `line-end_line kind name`, indented two spaces per nesting level.
 - `changes`: a heading line per file, `path (status, +added -removed, why unparsed)` with the parts that apply (`renamed from OLD`, `copied from OLD`). With `--diff`, the file's own `+line:text` and `-line:text` lines follow. Then `  status kind Container.name line-end_line (+added -removed)` per definition, with `from PATH:LINE` or `to PATH:LINE` before the counts for a moved one, and with `--diff` its lines.

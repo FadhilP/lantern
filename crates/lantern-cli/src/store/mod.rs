@@ -1,5 +1,6 @@
 //! SQLite storage: one shard per root.
 
+pub(crate) mod refs;
 pub(crate) mod shard;
 pub(crate) mod trigram;
 
@@ -12,7 +13,7 @@ use rusqlite::{Connection, ErrorCode, OpenFlags};
 
 use crate::error::{Error, Result};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Opens a database with the shared pragmas and runs `schema` when `user_version` is 0.
 fn open(path: &Path, schema: &str) -> Result<Connection> {

@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::thread;
 
 use regex_syntax::hir::{ClassUnicode, ClassUnicodeRange};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -9,8 +10,13 @@ use crate::error::{Error, Result};
 /// On vscode, 512 made a one-file edit about 40% slower for 10% less space.
 const BLOCK: i64 = 256;
 
-/// About 40 bytes each, so the writer's buffer stays near 80 MB.
+/// About 32 bytes each, so the writer's buffer stays near 64 MB.
 const FLUSH_CHANGES: usize = 2_000_000;
+
+/// A new shard flushes between two blocks from this size on. Blob ids come in ascending order,
+/// so each row is then written once, and the sorts are small. A flush inside a block makes the
+/// next one read and replace that block's rows.
+const FLUSH_BETWEEN_BLOCKS: usize = FLUSH_CHANGES / 4;
 
 /// Folds like the regex engine's simple case folding, so the index never drops a `(?i)` match.
 pub(crate) fn fold(c: char) -> char {
@@ -77,14 +83,57 @@ impl Trigram {
     }
 }
 
-fn next_bit(c: char) -> u8 {
-    1 << (u32::from(c).wrapping_mul(0x9E37_79B1) >> 29)
+/// From this many occurrences in a blob, a posting also stores `pair`: the one-character bloom
+/// of a frequent trigram is too full to reject much.
+const PAIR_FROM: u32 = 4;
+
+fn hash(c: u32, bits: u32) -> u8 {
+    (c.wrapping_mul(0x9E37_79B1) >> (32 - bits)) as u8
+}
+
+/// What the characters after one occurrence of a trigram tell.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Follow {
+    /// One of 8 bits, from the next character.
+    next: u8,
+    /// One of 8 bits, from the next two characters.
+    pair: u8,
+    /// Four hash bits of each of the next two characters.
+    exact: u8,
+    /// The bits of `exact` that come from a character.
+    known: u8,
+}
+
+fn follow(chars: &[char], at: usize) -> Follow {
+    let Some(&first) = chars.get(at + 3) else {
+        return Follow::default();
+    };
+    let first = u32::from(first);
+    let next = 1 << hash(first, 3);
+    let Some(&second) = chars.get(at + 4) else {
+        return Follow {
+            next,
+            pair: 0,
+            exact: hash(first, 4) << 4,
+            known: 0xF0,
+        };
+    };
+    let second = u32::from(second);
+    Follow {
+        next,
+        pair: 1 << hash(first.wrapping_mul(31).wrapping_add(second), 3),
+        exact: hash(first, 4) << 4 | hash(second, 4),
+        known: 0xFF,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Occurrence {
     count: u32,
     next: u8,
+    pair: u8,
+    /// Of the first occurrence.
+    exact: u8,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -93,23 +142,32 @@ pub(crate) struct Trigrams(Vec<(Trigram, Occurrence)>);
 impl Trigrams {
     pub(crate) fn of(text: &str) -> Self {
         let chars: Vec<char> = text.chars().map(fold).collect();
-        let mut found: Vec<(Trigram, u8)> = chars
+        let mut found: Vec<(Trigram, Follow)> = chars
             .windows(3)
             .enumerate()
             .map(|(at, window)| {
-                let next = chars.get(at + 3).map_or(0, |&c| next_bit(c));
-                (Trigram::new([window[0], window[1], window[2]]), next)
+                let trigram = Trigram::new([window[0], window[1], window[2]]);
+                (trigram, follow(&chars, at))
             })
             .collect();
         found.sort_unstable_by_key(|&(trigram, _)| trigram);
         let mut grouped: Vec<(Trigram, Occurrence)> = Vec::new();
-        for (trigram, next) in found {
+        for (trigram, follow) in found {
             match grouped.last_mut() {
                 Some((last, seen)) if *last == trigram => {
                     seen.count += 1;
-                    seen.next |= next;
+                    seen.next |= follow.next;
+                    seen.pair |= follow.pair;
                 }
-                _ => grouped.push((trigram, Occurrence { count: 1, next })),
+                _ => grouped.push((
+                    trigram,
+                    Occurrence {
+                        count: 1,
+                        next: follow.next,
+                        pair: follow.pair,
+                        exact: follow.exact,
+                    },
+                )),
             }
         }
         Self(grouped)
@@ -120,9 +178,42 @@ impl Trigrams {
 struct Posting {
     blob: i64,
     count: u32,
+    /// `Follow::exact` when `count` is 1, else the bloom of `Follow::next`.
     next: u8,
+    /// The bloom of `Follow::pair`; 0 below `PAIR_FROM`.
+    pair: u8,
 }
 
+impl Posting {
+    fn new(blob: i64, seen: Occurrence) -> Self {
+        Self {
+            blob,
+            count: seen.count,
+            next: if seen.count == 1 {
+                seen.exact
+            } else {
+                seen.next
+            },
+            pair: if seen.count < PAIR_FROM { 0 } else { seen.pair },
+        }
+    }
+
+    /// False when the blob cannot hold the trigram as often as the literal does, or followed
+    /// by the literal's characters.
+    fn allows(&self, need: &Need) -> bool {
+        if self.count < need.times {
+            return false;
+        }
+        if self.count == 1 {
+            return self.next & need.follow.known == need.follow.exact;
+        }
+        self.next & need.follow.next == need.follow.next
+            && (self.count < PAIR_FROM || self.pair & need.follow.pair == need.follow.pair)
+    }
+}
+
+/// Per posting: a varint of the blob id delta and two bits for a count of 1 to 3; from
+/// `PAIR_FROM`, a varint of the rest of the count; `next`; from `PAIR_FROM`, `pair`.
 fn encode(postings: &[Posting], base: i64) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(postings.len() * 3);
     let mut previous = base;
@@ -130,13 +221,15 @@ fn encode(postings: &[Posting], base: i64) -> Vec<u8> {
         let delta = u64::try_from(posting.blob - previous)
             .expect("postings are sorted by blob id, from the block's first id");
         previous = posting.blob;
-        if posting.count > 1 {
-            put_varint(&mut bytes, delta << 1 | 1);
-            put_varint(&mut bytes, u64::from(posting.count - 2));
-        } else {
-            put_varint(&mut bytes, delta << 1);
+        let small = u64::from(posting.count.min(PAIR_FROM) - 1);
+        put_varint(&mut bytes, delta << 2 | small);
+        if posting.count >= PAIR_FROM {
+            put_varint(&mut bytes, u64::from(posting.count - PAIR_FROM));
         }
         bytes.push(posting.next);
+        if posting.count >= PAIR_FROM {
+            bytes.push(posting.pair);
+        }
     }
     bytes
 }
@@ -148,24 +241,35 @@ fn decode(bytes: &[u8], base: i64) -> Result<Vec<Posting>> {
     let mut blob = base;
     while at < bytes.len() {
         let head = take_varint(bytes, &mut at).ok_or_else(corrupt)?;
-        let delta = i64::try_from(head >> 1).map_err(|_| corrupt())?;
+        let delta = i64::try_from(head >> 2).map_err(|_| corrupt())?;
         blob = blob.checked_add(delta).ok_or_else(corrupt)?;
         let repeated = postings.last().is_some_and(|last| last.blob == blob);
         if repeated || blob >= base + BLOCK {
             return Err(corrupt());
         }
-        let count = if head & 1 == 1 {
-            let extra = take_varint(bytes, &mut at).ok_or_else(corrupt)?;
-            extra
-                .checked_add(2)
+        let small = (head & 3) as u32 + 1;
+        let count = if small == PAIR_FROM {
+            let rest = take_varint(bytes, &mut at).ok_or_else(corrupt)?;
+            rest.checked_add(u64::from(PAIR_FROM))
                 .and_then(|count| u32::try_from(count).ok())
                 .ok_or_else(corrupt)?
         } else {
-            1
+            small
         };
         let next = *bytes.get(at).ok_or_else(corrupt)?;
         at += 1;
-        postings.push(Posting { blob, count, next });
+        let pair = if count >= PAIR_FROM {
+            at += 1;
+            *bytes.get(at - 1).ok_or_else(corrupt)?
+        } else {
+            0
+        };
+        postings.push(Posting {
+            blob,
+            count,
+            next,
+            pair,
+        });
     }
     Ok(postings)
 }
@@ -199,9 +303,16 @@ enum Op {
 
 #[derive(Debug)]
 struct Change {
-    block: i64,
     trigram: Trigram,
     op: Op,
+}
+
+impl Change {
+    fn block(&self) -> i64 {
+        match self.op {
+            Op::Add(Posting { blob, .. }) | Op::Remove(blob) => blob / BLOCK,
+        }
+    }
 }
 
 /// Call [`Pending::finish`] before commit, or the buffered changes are lost.
@@ -227,16 +338,11 @@ impl Pending {
     }
 
     pub(crate) fn add(&mut self, conn: &Connection, blob: i64, trigrams: &Trigrams) -> Result<()> {
-        let block = blob / BLOCK;
+        self.flush_between_blocks(conn, blob)?;
         self.changes
             .extend(trigrams.0.iter().map(|&(trigram, seen)| Change {
-                block,
                 trigram,
-                op: Op::Add(Posting {
-                    blob,
-                    count: seen.count,
-                    next: seen.next,
-                }),
+                op: Op::Add(Posting::new(blob, seen)),
             }));
         self.flush_when_full(conn)
     }
@@ -247,10 +353,8 @@ impl Pending {
         blob: i64,
         trigrams: &Trigrams,
     ) -> Result<()> {
-        let block = blob / BLOCK;
         self.changes
             .extend(trigrams.0.iter().map(|&(trigram, _)| Change {
-                block,
                 trigram,
                 op: Op::Remove(blob),
             }));
@@ -259,6 +363,20 @@ impl Pending {
 
     pub(crate) fn finish(mut self, conn: &Connection) -> Result<()> {
         self.flush(conn)
+    }
+
+    /// Not in a shard with rows: there the last flush runs beside the scan that follows the
+    /// reads, and an early flush would take work out of that time.
+    fn flush_between_blocks(&mut self, conn: &Connection, blob: i64) -> Result<()> {
+        let block_ended = self
+            .changes
+            .last()
+            .is_some_and(|last| last.block() != blob / BLOCK);
+        let large = self.changes.len() >= FLUSH_BETWEEN_BLOCKS;
+        if self.started_empty && block_ended && large {
+            self.flush(conn)?;
+        }
+        Ok(())
     }
 
     fn flush_when_full(&mut self, conn: &Connection) -> Result<()> {
@@ -270,8 +388,7 @@ impl Pending {
 
     fn flush(&mut self, conn: &Connection) -> Result<()> {
         let mut changes = std::mem::take(&mut self.changes);
-        // Stable keeps a row's changes in order; rayon here deadlocks with workers sending to us.
-        changes.sort_by_key(|change| (change.block, change.trigram));
+        sort(&mut changes);
         let mut read =
             conn.prepare_cached("SELECT postings FROM trigrams WHERE block = ?1 AND trigram = ?2")?;
         let mut write = conn.prepare_cached(
@@ -279,8 +396,8 @@ impl Pending {
         )?;
         let mut delete =
             conn.prepare_cached("DELETE FROM trigrams WHERE block = ?1 AND trigram = ?2")?;
-        for row in changes.chunk_by(|a, b| (a.block, a.trigram) == (b.block, b.trigram)) {
-            let (block, trigram) = (row[0].block, row[0].trigram);
+        for row in changes.chunk_by(|a, b| (a.block(), a.trigram) == (b.block(), b.trigram)) {
+            let (block, trigram) = (row[0].block(), row[0].trigram);
             let base = block * BLOCK;
             let may_be_stored = !self.started_empty || self.written.contains(&block);
             let stored: Option<Vec<u8>> = if may_be_stored {
@@ -302,10 +419,27 @@ impl Pending {
                 delete.execute(params![block, trigram.0])?;
             }
         }
-        self.written
-            .extend(changes.iter().map(|change| change.block));
+        self.written.extend(changes.iter().map(Change::block));
         Ok(())
     }
+}
+
+const SORT_THREADS: usize = 4;
+
+/// By row. Stable, so a row's changes stay in order. Rayon would deadlock here: its workers
+/// block while they send to this thread.
+fn sort(changes: &mut [Change]) {
+    let row = |change: &Change| (change.block(), change.trigram);
+    if changes.len() >= FLUSH_BETWEEN_BLOCKS {
+        let part = changes.len().div_ceil(SORT_THREADS);
+        thread::scope(|scope| {
+            for chunk in changes.chunks_mut(part) {
+                scope.spawn(move || chunk.sort_by_key(row));
+            }
+        });
+    }
+    // Merges the sorted parts of a large list.
+    changes.sort_by_key(row);
 }
 
 fn apply(postings: &mut Vec<Posting>, op: &Op) {
@@ -338,16 +472,16 @@ pub(crate) fn candidates(conn: &Connection, literal: &str) -> Result<HashMap<i64
     'blocks: for block in 0..=last.unwrap_or(-1) {
         let base = block * BLOCK;
         let mut alive: Option<Vec<(i64, u32)>> = None;
-        for &(trigram, next) in &needs {
+        for need in &needs {
             let stored: Option<Vec<u8>> = read
-                .query_row(params![block, trigram.0], |row| row.get(0))
+                .query_row(params![block, need.trigram.0], |row| row.get(0))
                 .optional()?;
             let Some(bytes) = stored else {
                 continue 'blocks;
             };
             let usable = decode(&bytes, base)?
                 .into_iter()
-                .filter(|posting| posting.next & next == next);
+                .filter(|posting| posting.allows(need));
             let narrowed = match alive {
                 None => usable
                     .map(|posting| (posting.blob, posting.count))
@@ -364,15 +498,31 @@ pub(crate) fn candidates(conn: &Connection, literal: &str) -> Result<HashMap<i64
     Ok(found)
 }
 
-fn needs(chars: &[char]) -> Vec<(Trigram, u8)> {
-    let mut needs: BTreeMap<Trigram, u8> = BTreeMap::new();
+/// What a blob with the literal has for one of its trigrams.
+#[derive(Debug)]
+struct Need {
+    trigram: Trigram,
+    /// How often the literal holds the trigram.
+    times: u32,
+    /// The union over those places; `exact` and `known` only count when `times` is 1.
+    follow: Follow,
+}
+
+fn needs(chars: &[char]) -> Vec<Need> {
+    let mut needs: BTreeMap<Trigram, Need> = BTreeMap::new();
     for (at, window) in chars.windows(3).enumerate() {
-        let next = chars.get(at + 3).map_or(0, |&c| next_bit(c));
-        *needs
-            .entry(Trigram::new([window[0], window[1], window[2]]))
-            .or_default() |= next;
+        let trigram = Trigram::new([window[0], window[1], window[2]]);
+        let here = follow(chars, at);
+        let need = needs.entry(trigram).or_insert(Need {
+            trigram,
+            times: 0,
+            follow: here,
+        });
+        need.times += 1;
+        need.follow.next |= here.next;
+        need.follow.pair |= here.pair;
     }
-    needs.into_iter().collect()
+    needs.into_values().collect()
 }
 
 fn intersect(
@@ -431,18 +581,61 @@ mod tests {
                 blob: base,
                 count: 1,
                 next: 0,
+                pair: 0,
             },
             Posting {
                 blob: base + 5,
-                count: 2,
+                count: 3,
                 next: 0x81,
+                pair: 0,
+            },
+            Posting {
+                blob: base + 6,
+                count: 4,
+                next: 0x81,
+                pair: 0x42,
             },
             Posting {
                 blob: base + 255,
                 count: 70_000,
                 next: 0xFF,
+                pair: 0xFF,
             },
         ];
         assert_eq!(decode(&encode(&postings, base), base).ok(), Some(postings));
+    }
+
+    fn allowed(text: &str, literal: &str) -> bool {
+        let chars: Vec<char> = literal.chars().collect();
+        let stored = Trigrams::of(text).0;
+        needs(&chars).iter().all(|need| {
+            stored
+                .iter()
+                .find(|(trigram, _)| *trigram == need.trigram)
+                .is_some_and(|&(_, seen)| Posting::new(1, seen).allows(need))
+        })
+    }
+
+    #[test]
+    fn a_blob_with_the_literal_is_never_filtered_out() {
+        let text = "abcabcabcabd abcd xyz xyzw aaaaaa abcab";
+        let chars: Vec<char> = text.chars().collect();
+        for length in 3..=8 {
+            for literal in chars.windows(length) {
+                let literal: String = literal.iter().collect();
+                assert!(allowed(text, &literal), "{literal:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_characters_after_a_trigram_filter() {
+        assert!(!allowed("abcd abce", "abcx"));
+        assert!(!allowed("abcde", "abcdx"));
+        assert!(!allowed(
+            "abcd abcd abcd abcde bcdw bcdw bcdw bcdw",
+            "abcdw"
+        ));
+        assert!(!allowed("aaa", "aaaa"));
     }
 }

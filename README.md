@@ -69,7 +69,7 @@ Measured on [microsoft/vscode](https://github.com/microsoft/vscode) at `819bb82`
 
 | Command | Time | Output |
 |---|--:|---|
-| `lantern symbols TextModel` | 183 ms (15 ms) | 1.5 KB: the 11 exact definitions, and a count of the 169 looser matches that `--fuzzy` adds |
+| `lantern symbols TextModel` | 176 ms (14 ms) | 1.5 KB: the 11 exact definitions, and a count of the 169 looser matches that `--fuzzy` adds |
 | `rg -n -w TextModel` | 847 ms | 1.48 MB: all 476 lines that use the name |
 | `rg -n -w -M 500 TextModel` | 853 ms | 70 KB, 476 lines |
 | `rg -n -w "class TextModel"` | 833 ms | 0.2 KB, 3 lines |
@@ -79,7 +79,7 @@ Measured on [microsoft/vscode](https://github.com/microsoft/vscode) at `819bb82`
 
 | Command | Time | Output |
 |---|--:|---|
-| `lantern code onDidChangeContent --limit 10000 --per-file 1000` | 229 ms (59 ms) | 51 KB |
+| `lantern code onDidChangeContent --limit 10000 --per-file 1000` | 230 ms (66 ms) | 65 KB, with the definition around each group of matches |
 | `rg -n -i onDidChangeContent` | 830 ms | 606 KB |
 | `rg -n -i -M 500 onDidChangeContent` | 841 ms | 69 KB |
 | `grep -rn -i onDidChangeContent .` | 3,676 ms | 607 KB |
@@ -88,22 +88,22 @@ Measured on [microsoft/vscode](https://github.com/microsoft/vscode) at `819bb82`
 
 | Command | Time | Output |
 |---|--:|---|
-| `lantern refs getWordAtPosition` | 188 ms (13 ms) | 5.5 KB: the first page of 30 calls, each with its calling function |
+| `lantern refs getWordAtPosition` | 171 ms (12 ms) | 5.5 KB: the first page of 30 calls, each with its calling function |
 | `rg -n -w getWordAtPosition` | 837 ms | 52 KB: 80 lines of calls, definitions, and comments |
 
 ### What is in `textModel.ts` (2,745 lines)?
 
 | Command | Time | Output |
 |---|--:|---|
-| `lantern outline src/vs/editor/common/model/textModel.ts` | 181 ms (9 ms) | 8.6 KB: all 237 definitions, nested |
+| `lantern outline src/vs/editor/common/model/textModel.ts` | 170 ms (10 ms) | 8.6 KB: all 237 definitions, nested |
 | `cat src/vs/editor/common/model/textModel.ts` | 10 ms | 112 KB |
 
 ### What the numbers show
 
 - **Output size.** Lantern prints less because it pages results, cuts lines at 200 characters (500 in JSON), and answers with definitions instead of every line that contains the name. One test fixture in vscode has a 1.4 MB line, so plain `rg` and `grep` print megabytes for a common name. `rg -M 500` removes most of that gap for text search.
-- **Speed.** With the refresh, each query here was about 4 times faster than `rg`; the refresh takes most of that time. With `--stale-ok`, queries take 9–59 ms.
+- **Speed.** With the refresh, each query here was about 4 times faster than `rg`; the refresh takes most of that time. With `--stale-ok`, queries take 10–66 ms.
 - **When `rg` is better.** A precise pattern such as `rg -w "class TextModel"` prints less than `symbols`, if you know the syntax of the language. Reading a whole file with `cat` is faster than `outline`, but it prints 13 times more.
-- **Costs.** The first query builds the index: 18 s for vscode. The index takes 321 MB of disk, about 80% of the working tree. A query after you change one file takes about 0.5 s, because it parses and stores that file again.
+- **Costs.** The first query builds the index: 15 s for vscode. The index takes 266 MB of disk, about 67% of the working tree. A query after you change one file takes about 0.5 s, because it parses and stores that file again.
 
 ## Use with agents
 

@@ -208,7 +208,8 @@ pub fn symbol_lines(hits: &[SymbolHit]) -> Vec<String> {
     lines
 }
 
-/// One heading per file, then rg-style `line:text` matches and `line-text` context.
+/// One heading per file, then rg-style `line:text` matches and `line-text` context, with an
+/// indented `in kind name` line right above a match whose enclosing definition changes.
 pub fn code_lines(hits: &[CodeHit]) -> Vec<String> {
     let mut lines = Vec::new();
     for hit in hits {
@@ -220,11 +221,24 @@ pub fn code_lines(hits: &[CodeHit]) -> Vec<String> {
         } else {
             hit.path.clone()
         });
+        let mut site = None;
         for found in &hit.matches {
             let before = found.before.as_deref().unwrap_or_default();
             let first = found.line - before.len();
             for (offset, text) in before.iter().enumerate() {
                 lines.push(format!("{}-{text}", first + offset));
+            }
+            if found.enclosing.as_ref() != site {
+                site = found.enclosing.as_ref();
+                lines.push(
+                    site.map_or("  not in a named definition".to_owned(), |enclosing| {
+                        format!(
+                            "  in {} {}",
+                            enclosing.kind.as_str(),
+                            qualified(enclosing.container.as_deref(), &enclosing.name)
+                        )
+                    }),
+                );
             }
             lines.push(format!("{}:{}", found.line, found.text));
             for (offset, text) in found.after.iter().flatten().enumerate() {

@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use clap::ValueEnum;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 
 use super::{Opened, PathFilter, validate_text};
@@ -13,7 +13,7 @@ use crate::language::FileFlags;
 use crate::limits::{MAX_GRAPH_DEPTH, MAX_GRAPH_NODES};
 use crate::query::Freshness;
 use crate::query::symbols::split_qualified;
-use crate::store::shard;
+use crate::store::{refs, shard};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
 pub enum Direction {
@@ -284,48 +284,55 @@ impl Builder<'_> {
     /// Calls to the definition's name, grouped by the definition that contains each one.
     fn callers(&mut self, target: usize, definition: &Definition) -> Result<Vec<usize>> {
         let mut statement = self.opened.conn.prepare_cached(
-            "SELECT r.kind, r.line, f.path, es.id, en.name, es.kind, es.container, es.line, f.flags
-             FROM names n JOIN refs r ON r.name_id = n.id
-             JOIN files f ON f.blob_id = r.blob_id AND (?2 OR f.flags & 1 = 0)
-             LEFT JOIN symbols es ON es.id = r.enclosing
-             LEFT JOIN names en ON en.id = es.name_id
-             WHERE n.name = ?1 AND r.kind = ?3",
+            "SELECT f.path, f.flags, n.id, r.groups
+             FROM names n JOIN ref_names rn ON rn.name_id = n.id
+             JOIN refs r ON r.blob_id = rn.blob_id
+             JOIN files f ON f.blob_id = rn.blob_id AND (?2 OR f.flags & 1 = 0)
+             WHERE n.name = ?1",
         )?;
-        let parameters = params![definition.name, self.include_generated, RefKind::Call];
-        let rows = statement.query_map(parameters, |row| {
-            Ok((
-                row.get::<_, RefKind>(0)?,
-                row.get::<_, u32>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<SymbolKind>>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, Option<u32>>(7)?,
-                FileFlags(row.get(8)?),
-            ))
-        })?;
+        let mut enclosing = self.opened.conn.prepare_cached(
+            "SELECT n.name, s.container, s.kind, s.line
+             FROM symbols s JOIN names n ON n.id = s.name_id WHERE s.id = ?1",
+        )?;
+        let mut rows = statement.query(params![definition.name, self.include_generated])?;
         let mut sources = Vec::new();
-        for row in rows {
-            let (kind, line, path, symbol, name, symbol_kind, container, symbol_line, flags) = row?;
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
             if !self.opened.accept(&path, self.filter) {
                 continue;
             }
-            let source = match (symbol, name, symbol_kind) {
-                (Some(id), Some(name), Some(kind)) => Vertex::Definition(Definition {
-                    id,
-                    name,
-                    container,
-                    kind,
-                    path: path.clone(),
-                    line: symbol_line.unwrap_or(line),
-                    test: flags.is_test(),
-                }),
-                _ => Vertex::File(path.clone()),
-            };
-            sources.push((source, kind, path, line));
+            let test = FileFlags(row.get(1)?).is_test();
+            let groups: Vec<u8> = row.get(3)?;
+            for call in refs::of_name(&groups, row.get(2)?)? {
+                if call.kind != RefKind::Call {
+                    continue;
+                }
+                let symbol = match call.enclosing {
+                    Some(id) => enclosing
+                        .query_row([id], |found| {
+                            Ok(Definition {
+                                id,
+                                name: found.get(0)?,
+                                container: found.get(1)?,
+                                kind: found.get(2)?,
+                                path: path.clone(),
+                                line: found.get(3)?,
+                                test,
+                            })
+                        })
+                        .optional()?,
+                    None => None,
+                };
+                let source = match symbol {
+                    Some(definition) => Vertex::Definition(definition),
+                    None => Vertex::File(path.clone()),
+                };
+                sources.push((source, call.kind, path.clone(), call.line));
+            }
         }
+        drop(rows);
         drop(statement);
+        drop(enclosing);
         sources.sort_by(|a, b| (&a.2, a.3).cmp(&(&b.2, b.3)));
         let mut added = Vec::new();
         for (source, kind, _, line) in sources {
@@ -341,20 +348,21 @@ impl Builder<'_> {
     /// Calls whose innermost definition is this one, resolved by name; code outside tests
     /// never resolves to a definition in a test file.
     fn callees(&mut self, source: usize, definition: &Definition) -> Result<Vec<usize>> {
-        let mut statement = self.opened.conn.prepare_cached(
-            "SELECT n.name, r.kind, r.line FROM symbols s
-             JOIN refs r ON r.blob_id = s.blob_id AND r.line BETWEEN s.start_line AND s.end_line
-             JOIN names n ON n.id = r.name_id
-             WHERE s.id = ?1 AND r.enclosing = ?1 AND r.kind = ?2 ORDER BY r.line, r.col",
-        )?;
-        let calls: Vec<(String, RefKind, u32)> = statement
-            .query_map(params![definition.id, RefKind::Call], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        drop(statement);
+        let conn = &self.opened.conn;
+        let blob_id: i64 = conn
+            .prepare_cached("SELECT blob_id FROM symbols WHERE id = ?1")?
+            .query_row([definition.id], |row| row.get(0))?;
+        let mut calls = refs::of_blob(conn, blob_id)?;
+        calls.retain(|(_, call)| {
+            call.enclosing == Some(definition.id) && call.kind == RefKind::Call
+        });
+        calls.sort_by_key(|&(_, call)| (call.line, call.col));
         let mut added = Vec::new();
-        for (name, kind, line) in calls {
+        for (name_id, call) in calls {
+            let (kind, line) = (call.kind, call.line);
+            let name: String = conn
+                .prepare_cached("SELECT name FROM names WHERE id = ?1")?
+                .query_row([name_id], |row| row.get(0))?;
             let mut targets = self.definitions_named(&name)?;
             if !definition.test {
                 targets.retain(|target| !target.test);

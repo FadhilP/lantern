@@ -2,7 +2,7 @@
 
 use std::process::Command;
 
-use crate::common::{Fixture, count, deny_dir, files_with, git, names, strings};
+use crate::common::{Fixture, count, deny_dir, files_with, git, names, paths, strings};
 
 #[test]
 fn scoped_ignores_negation_and_default_opt_ins() {
@@ -407,6 +407,38 @@ fn an_upgrade_rereads_files_whose_language_detection_changed() {
 }
 
 #[test]
+fn refs_follow_edits_deletions_and_a_new_extractor() {
+    let f = Fixture::new();
+    f.write("a.ts", "export function one() { shared(); }\n");
+    f.write("b.ts", "export function two() { shared(); other(); }\n");
+    f.ok(&["index"]);
+    assert_eq!(
+        paths(&f.ok(&["refs", "shared"])),
+        strings(&["a.ts", "b.ts"])
+    );
+
+    f.write("a.ts", "export function one() { other(); }\n");
+    assert_eq!(paths(&f.ok(&["refs", "shared"])), strings(&["b.ts"]));
+    assert_eq!(paths(&f.ok(&["refs", "other"])), strings(&["a.ts", "b.ts"]));
+
+    f.remove("b.ts");
+    assert!(paths(&f.ok(&["refs", "shared"])).is_empty());
+    // The new blob takes the id that the removed one freed.
+    f.write("c.ts", "export function three() { shared(); }\n");
+    assert_eq!(paths(&f.ok(&["refs", "shared"])), strings(&["c.ts"]));
+
+    let conn = rusqlite::Connection::open(f.shard()).expect("open shard");
+    conn.execute_batch("UPDATE meta SET extractor = 'older'")
+        .expect("simulate an upgrade");
+    drop(conn);
+    assert_eq!(count(&f.ok(&["index"]), "refs"), 2);
+    let refs = f.ok(&["refs", "other"]);
+    assert_eq!(paths(&refs), strings(&["a.ts"]));
+    assert_eq!(refs["results"][0]["enclosing"]["name"], "one");
+    assert_eq!(f.ok(&["graph", "one"])["unresolved"][0], "other");
+}
+
+#[test]
 fn a_timed_out_parse_is_retried_on_the_next_refresh() {
     let f = Fixture::new();
     f.write("a.ts", "export function retried() {}\n");
@@ -419,8 +451,11 @@ fn a_timed_out_parse_is_retried_on_the_next_refresh() {
         .expect("one shard");
     // As if the first parse had run out of time under load.
     let conn = rusqlite::Connection::open(&shard).expect("open shard");
-    conn.execute_batch("DELETE FROM refs; DELETE FROM symbols; UPDATE blobs SET timeouts = 1;")
-        .expect("simulate a timeout");
+    conn.execute_batch(
+        "DELETE FROM refs; DELETE FROM ref_names; DELETE FROM symbols;
+         UPDATE blobs SET timeouts = 1;",
+    )
+    .expect("simulate a timeout");
     drop(conn);
     assert_eq!(names(&f.ok(&["symbols", "retried"])), strings(&["retried"]));
 }
@@ -445,7 +480,7 @@ fn files_out_of_parse_retries_stay_visible_until_a_rebuild() {
         .expect("one shard");
     let conn = rusqlite::Connection::open(&shard).expect("open shard");
     conn.execute_batch(
-        "DELETE FROM refs; DELETE FROM symbols;
+        "DELETE FROM refs; DELETE FROM ref_names; DELETE FROM symbols;
          UPDATE blobs SET timeouts = 3
          WHERE id = (SELECT blob_id FROM files WHERE path = 'a.ts');",
     )

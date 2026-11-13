@@ -29,6 +29,7 @@ Pick by what you search for:
 - **To read a definition:** use `symbols X --body`. It prints the found definitions with their source lines, so you do not need a separate read.
 - **Before you read a file:** run `outline`, then read only the line range you need. Do not `cat` a whole file or read a large `sed -n 1,200p` range.
 - **To read around a match:** use `code --context N`. You do not need a separate read.
+- **To find which function a match is in:** read the indented `in kind Container.name` line above it in `code` output. For that function's source, run `symbols Container.name --body`. You do not need `outline` or a read of the file.
 - **To review a diff or a branch:** run `lantern changes RANGE` for the changed definitions per file, then `lantern changes RANGE --diff NAME` for the changed lines of one definition, or `lantern changes RANGE --diff` for all changed lines. A `moved` definition has the same text as at its old place, apart from lines without letters or digits, and lists no lines; check only that it fits its new place.
 
 Run the command from inside the repository, or pass `-C <dir>`. `-C` takes a directory, not a context count; for context lines use `--context N`. In a Git repository, the first query builds the index and later queries are fast; you do not need to run `lantern index` first. Outside Git, a folder with no index makes a query exit 2. Run `lantern index <dir>` only if the user asked to search that folder; otherwise ask them first. Never index the home folder or a drive root unless the user asks for it (that needs `--force`).
@@ -40,7 +41,7 @@ Run the command from inside the repository, or pass `-C <dir>`. `-C` takes a dir
 The default output is compact text, made for agents. Paths are relative to the current directory (`../` for a file outside it), so you can pass a printed path to `--path` or `outline` from the same directory. Lines are 1-based.
 
 - `symbols`: `path:line-end_line kind[ in Container]: signature`, one per line. With `--body`, `line:text` source lines follow each definition, then `-- body cut: N more lines` when it is longer than 100 lines.
-- `code`: a heading line with the file path (`path (N matches, M shown)` when `--per-file` cut matches; `path (N matches)` with `-l`), then `line:text` for each match and `line-text` for `--context` lines.
+- `code`: a heading line with the file path (`path (N matches, M shown)` when `--per-file` cut matches; `path (N matches)` with `-l`), then `line:text` for each match and `line-text` for `--context` lines. Where the innermost definition around the matches changes, an indented line right above the match names it: `  in kind Container.name`, or `  not in a named definition` after one ends (code in an anonymous function counts as outside). A definition's decorators and doc comments count as inside it. It names only the matches; `--context` lines can be in other definitions.
 - `refs`: a heading line with the file path, then `line:column kind[ in Container.name]: text` for each reference. Two calls on one line share the text and differ in column.
 - `outline`: `line-end_line kind name`, indented two spaces per nesting level. Members nest under their type, also when they are on the same line (`enum E { A, B }`) or outside it (a Rust `impl`, a Go receiver method).
 - `changes`: a heading line per file, `path (status, +added -removed, why unparsed)` with the parts that apply, then `  status kind Container.name line-end_line (+added -removed)` per changed definition (`added`, `removed`, `modified`, or `moved`). A moved one adds `from PATH:LINE` at its new place or `to PATH:LINE` at its old place. With `--diff`, `+line:text` and `-line:text` lines follow: right after the heading for the file's lines outside every definition (imports, top-level code, or all lines of an unparsed file), and after each definition for its lines. A removed definition gives its old lines.
@@ -56,7 +57,7 @@ For the next page, run the same command with `--cursor <value>`.
 
 Add `--json` only when a program parses the output. Each command then prints one JSON document; null fields and `truncated: false` are left out. List pages are `{"schema":1,"freshness","indexed_at","truncated"?,"next_cursor"?,"hint"?,"results":[...]}`. `freshness` is `"walk"` when the query refreshed the index first, and `"stale"` with `--stale-ok`. Rows:
 - `symbols`: `name, kind, container?, path, line, end_line, signature, body?: {line, text}`.
-- `code`: `path, match_count, matches: [{line, column, text, before?, after?}]`.
+- `code`: `path, match_count, matches: [{line, column, text, before?, after?, enclosing?: {name, container?, kind}}]`.
 - `refs`: `path, line, column, kind, text, enclosing?: {name, container?, kind}`.
 - `outline`: top-level symbols with nested `children`; the page also has `path` and `language`.
 - `changes`: `path, old_path?, status, added, removed, unparsed?, symbols: [{status, kind, name, container?, line, end_line, from?: {path, line}, to?: {path, line}, added, removed, lines?: [{sign, line, text}]}], lines?`.

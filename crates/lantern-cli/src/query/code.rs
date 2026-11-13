@@ -1,14 +1,15 @@
 //! `code`: where does this text or pattern occur? Trigrams only filter; the real matcher decides.
 
-use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use clap::ValueEnum;
 use rayon::prelude::*;
 use regex::{Regex, RegexBuilder};
-use regex_syntax::hir::{Hir, HirKind};
+use regex_syntax::hir::{Class, Hir, HirKind};
 use serde::Serialize;
 
+use super::refs::Enclosing;
 use super::{Opened, Page, PageRequest, PathFilter, language_names, validate_limit, validate_text};
 use crate::error::{Error, Result};
 use crate::extract::truncate_chars;
@@ -54,6 +55,9 @@ pub struct LineMatch {
     pub before: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<Vec<String>>,
+    /// The innermost definition around the line, for the shown page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enclosing: Option<Enclosing>,
 }
 
 #[derive(Debug)]
@@ -143,8 +147,8 @@ pub(crate) fn run(
 
     // A verified file is final once no unverified candidate can rank before it.
     let mut verified: HashMap<i64, Option<FileMatches>> = HashMap::new();
-    let mut ready: Vec<(Rank, FileMatches)> = Vec::new();
-    let mut hits = Vec::new();
+    let mut ready: Vec<(Rank, i64, FileMatches)> = Vec::new();
+    let mut hits: Vec<(i64, CodeHit)> = Vec::new();
     let mut next = 0;
     while hits.len() < needed.rows {
         let best = (0..ready.len()).min_by(|&a, &b| ready[a].0.order(&ready[b].0));
@@ -154,12 +158,15 @@ pub(crate) fn run(
                 .is_none_or(|bound| ready[at].0.order(&bound.rank) != Ordering::Greater)
         });
         if let Some(at) = settled {
-            let (rank, found) = ready.swap_remove(at);
-            hits.push(CodeHit {
-                path: rank.path,
-                match_count: found.match_count,
-                matches: found.matches,
-            });
+            let (rank, blob_id, found) = ready.swap_remove(at);
+            hits.push((
+                blob_id,
+                CodeHit {
+                    path: rank.path,
+                    match_count: found.match_count,
+                    matches: found.matches,
+                },
+            ));
             continue;
         }
         if next == candidates.len() {
@@ -189,12 +196,46 @@ pub(crate) fn run(
                     score: found.score,
                     ..candidate.rank.clone()
                 };
-                ready.push((rank, found.clone()));
+                ready.push((rank, candidate.blob_id, found.clone()));
             }
         }
         next += batch.len();
     }
+    for (blob_id, hit) in hits.iter_mut().skip(needed.offset).take(request.limit) {
+        name_enclosing(opened, *blob_id, &mut hit.matches)?;
+    }
+    let hits = hits.into_iter().map(|(_, hit)| hit).collect();
     opened.page(&description, request, &filter, hits)
+}
+
+/// A definition's decorators and doc comments count as inside it.
+fn name_enclosing(opened: &Opened, blob_id: i64, matches: &mut [LineMatch]) -> Result<()> {
+    if matches.is_empty() {
+        return Ok(());
+    }
+    let mut statement = opened.conn.prepare_cached(
+        "SELECT n.name, s.container, s.kind, s.start_line, s.end_line
+         FROM symbols s JOIN names n ON n.id = s.name_id WHERE s.blob_id = ?1",
+    )?;
+    let symbols: Vec<(Enclosing, i64, i64)> = statement
+        .query_map([blob_id], |row| {
+            let enclosing = Enclosing {
+                name: row.get(0)?,
+                container: row.get(1)?,
+                kind: row.get(2)?,
+            };
+            Ok((enclosing, row.get(3)?, row.get(4)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for found in matches {
+        let line = i64::try_from(found.line).unwrap_or(i64::MAX);
+        found.enclosing = symbols
+            .iter()
+            .filter(|(_, start, end)| (*start..=*end).contains(&line))
+            .max_by_key(|&&(_, start, end)| (start, Reverse(end)))
+            .map(|(enclosing, _, _)| enclosing.clone());
+    }
+    Ok(())
 }
 
 fn verify<F>(
@@ -383,6 +424,7 @@ fn search(
             text: match_text(line, found.start(), line_chars),
             before: around(before_start..index),
             after: around(index + 1..after_end),
+            enclosing: None,
         });
         shown_until = after_end;
     }
@@ -420,7 +462,7 @@ enum Need {
 
 fn need_of(pattern: &str, regex: bool) -> Need {
     if !regex {
-        return literal(pattern.as_bytes());
+        return literal(&trigram::folded(pattern));
     }
     // Parsed case-sensitively: the trigram index folds case, so the literals stay a valid filter.
     regex_syntax::ParserBuilder::new()
@@ -430,23 +472,32 @@ fn need_of(pattern: &str, regex: bool) -> Need {
 }
 
 fn need(hir: &Hir) -> Need {
+    if let Some(texts) = texts(hir) {
+        return any_of(&texts);
+    }
     match hir.kind() {
-        HirKind::Literal(literal_bytes) => literal(&literal_bytes.0),
         HirKind::Capture(capture) => need(&capture.sub),
         HirKind::Repetition(repetition) if repetition.min >= 1 => need(&repetition.sub),
         HirKind::Concat(parts) => {
             let mut needs = Vec::new();
-            let mut run: Vec<u8> = Vec::new();
+            let mut run = BTreeSet::from([String::new()]);
             for part in parts {
-                if let HirKind::Literal(bytes) = part.kind() {
-                    run.extend_from_slice(&bytes.0);
+                let known = texts(part);
+                let longer = known.as_ref().and_then(|tails| joined(&run, tails));
+                if let Some(longer) = longer {
+                    run = longer;
                     continue;
                 }
-                needs.push(literal(&run));
-                run.clear();
-                needs.push(need(part));
+                needs.push(any_of(&run));
+                run = match known {
+                    Some(texts) => texts,
+                    None => {
+                        needs.push(need(part));
+                        BTreeSet::from([String::new()])
+                    }
+                };
             }
-            needs.push(literal(&run));
+            needs.push(any_of(&run));
             Need::all(needs)
         }
         HirKind::Alternation(branches) => Need::either(branches.iter().map(need).collect()),
@@ -454,11 +505,67 @@ fn need(hir: &Hir) -> Need {
     }
 }
 
-/// Trigram search needs at least three characters.
-fn literal(bytes: &[u8]) -> Need {
-    match std::str::from_utf8(bytes) {
-        Ok(text) if text.chars().count() >= 3 => Need::Literal(trigram::folded(text)),
-        _ => Need::Anything,
+/// More texts than this, and a part of a pattern is not spelled out: each costs an index lookup.
+const MAX_TEXTS: usize = 4;
+
+/// Every text the expression can match, folded, when they are few. `(?i)` makes each letter a
+/// class of its case variants, which fold to one text.
+fn texts(hir: &Hir) -> Option<BTreeSet<String>> {
+    match hir.kind() {
+        HirKind::Empty | HirKind::Look(_) => Some(BTreeSet::from([String::new()])),
+        HirKind::Literal(literal) => {
+            let text = std::str::from_utf8(&literal.0).ok()?;
+            Some(BTreeSet::from([trigram::folded(text)]))
+        }
+        HirKind::Class(Class::Unicode(class)) => {
+            let members: usize = class.ranges().iter().map(|range| range.len()).sum();
+            let folded: BTreeSet<String> = (members <= 2 * MAX_TEXTS).then(|| {
+                let chars = class
+                    .ranges()
+                    .iter()
+                    .flat_map(|range| range.start()..=range.end());
+                chars.map(|c| trigram::fold(c).to_string()).collect()
+            })?;
+            (folded.len() <= MAX_TEXTS).then_some(folded)
+        }
+        HirKind::Capture(capture) => texts(&capture.sub),
+        HirKind::Concat(parts) => {
+            let mut run = BTreeSet::from([String::new()]);
+            for part in parts {
+                run = joined(&run, &texts(part)?)?;
+            }
+            Some(run)
+        }
+        HirKind::Alternation(branches) => {
+            let mut all = BTreeSet::new();
+            for branch in branches {
+                all.extend(texts(branch)?);
+            }
+            (all.len() <= MAX_TEXTS).then_some(all)
+        }
+        _ => None,
+    }
+}
+
+fn joined(heads: &BTreeSet<String>, tails: &BTreeSet<String>) -> Option<BTreeSet<String>> {
+    (heads.len() * tails.len() <= MAX_TEXTS).then(|| {
+        heads
+            .iter()
+            .flat_map(|head| tails.iter().map(move |tail| format!("{head}{tail}")))
+            .collect()
+    })
+}
+
+fn any_of(texts: &BTreeSet<String>) -> Need {
+    Need::either(texts.iter().map(|text| literal(text)).collect())
+}
+
+/// Trigram search needs at least three characters. `text` must be folded.
+fn literal(text: &str) -> Need {
+    if text.chars().count() >= 3 {
+        Need::Literal(text.to_owned())
+    } else {
+        Need::Anything
     }
 }
 
@@ -530,7 +637,7 @@ impl Need {
 
 #[cfg(test)]
 mod tests {
-    use super::{Need, looks_like_regex, need_of};
+    use super::{Need, looks_like_regex, need_of, trigram};
 
     #[test]
     fn regex_syntax_in_a_literal_is_told_from_code_punctuation() {
@@ -554,13 +661,36 @@ mod tests {
         );
         assert_eq!(
             need_of("(alpha|beta)x", true),
-            Need::Either(vec![literal("alpha"), literal("beta")])
+            Need::Either(vec![literal("alphax"), literal("betax")])
+        );
+        assert_eq!(
+            need_of(r"on(Did|Will)Change[A-Z]\w+", true),
+            Need::Either(vec![literal("ondidchange"), literal("onwillchange")])
+        );
+        assert_eq!(
+            need_of(r"\b[gs]et\b", true),
+            Need::Either(vec![literal("get"), literal("set")])
+        );
+        assert_eq!(
+            need_of("(a|b|c)(d|e|f)xyz", true),
+            Need::Either(vec![literal("dxyz"), literal("exyz"), literal("fxyz")])
+        );
+    }
+
+    #[test]
+    fn case_variants_in_a_pattern_fold_to_one_literal() {
+        let literal = |text: &str| Need::Literal(text.to_owned());
+        assert_eq!(need_of("(?i)Hello_World", true), literal("hello_world"));
+        assert_eq!(need_of("(?i)STRASSE", true), literal("strasse"));
+        assert_eq!(
+            need_of("(?i)Über|[Kk]elvin", true),
+            Need::Either(vec![literal("kelvin"), literal(&trigram::folded("über"))])
         );
     }
 
     #[test]
     fn short_or_optional_parts_force_a_full_scan() {
-        for pattern in ["ab|cde", "(?:hello)?", r"\w+", "(?i)hello"] {
+        for pattern in ["ab|cde", "(?:hello)?", r"\w+", "(?i)he", "[a-z]bc"] {
             assert_eq!(need_of(pattern, true), Need::Anything, "{pattern}");
         }
     }

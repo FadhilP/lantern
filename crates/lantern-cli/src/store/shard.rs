@@ -9,10 +9,11 @@ use rayon::prelude::*;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
-use crate::extract::Extraction;
+use crate::extract::{Extraction, Symbol};
 use crate::fsmeta::{EntryKind, Stat};
 use crate::language::FileFlags;
 use crate::source::SourceKind;
+use crate::store::refs::{self, Grouped};
 use crate::store::trigram::{Pending, Trigrams};
 
 const SCHEMA: &str = r"
@@ -60,15 +61,19 @@ CREATE TABLE symbols (
   -- The first line of the decorators, attributes, and doc comments before the definition.
   start_line INTEGER NOT NULL
 );
--- Keyed by position, so the table itself serves a file's refs and a definition's line range.
+-- The references of one blob, grouped by name; see `store::refs`. No cascade: with foreign keys
+-- on, a blob deleted before `refs::Pending::delete` ran fails, instead of leaving `ref_names` rows.
 CREATE TABLE refs (
-  blob_id INTEGER NOT NULL REFERENCES blobs ON DELETE CASCADE,
-  line INTEGER NOT NULL, col INTEGER NOT NULL,
+  blob_id INTEGER PRIMARY KEY REFERENCES blobs,
+  count INTEGER NOT NULL,
+  groups BLOB NOT NULL
+);
+-- The blobs with references to a name. `refs::Pending::delete` removes a blob's rows; a foreign
+-- key would need an index of its own.
+CREATE TABLE ref_names (
   name_id INTEGER NOT NULL REFERENCES names,
-  kind INTEGER NOT NULL,
-  -- A symbol of the same blob, deleted with it; a foreign key would need an index of its own.
-  enclosing INTEGER,
-  PRIMARY KEY (blob_id, line, col, name_id, kind)
+  blob_id INTEGER NOT NULL,
+  PRIMARY KEY (name_id, blob_id)
 ) WITHOUT ROWID;
 -- blob_id is NULL for binary and oversized files, so they are not reread on every refresh.
 CREATE TABLE files (
@@ -90,7 +95,6 @@ CREATE INDEX IF NOT EXISTS names_nocase ON names(name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS names_initials ON names(initials);
 CREATE INDEX IF NOT EXISTS symbols_name ON symbols(name_id);
 CREATE INDEX IF NOT EXISTS symbols_blob ON symbols(blob_id, line);
-CREATE INDEX IF NOT EXISTS refs_name ON refs(name_id);
 CREATE INDEX IF NOT EXISTS files_blob ON files(blob_id);
 ";
 
@@ -277,6 +281,7 @@ pub(crate) fn delete_file(conn: &Connection, path: &str) -> Result<()> {
 pub(crate) fn delete_orphans(
     conn: &Connection,
     trigrams: &mut Pending,
+    refs: &mut refs::Pending,
     candidates: impl IntoIterator<Item = i64>,
 ) -> Result<usize> {
     let mut used = conn.prepare_cached("SELECT 1 FROM files WHERE blob_id = ?1 LIMIT 1")?;
@@ -301,7 +306,7 @@ pub(crate) fn delete_orphans(
         for (&id, counted) in batch.iter().zip(&counted) {
             trigrams.remove(conn, id, counted)?;
             // Not left to the cascade: a new shard writes with foreign keys off.
-            delete_extraction(conn, id)?;
+            delete_extraction(conn, refs, id)?;
             blob.execute([id])?;
         }
     }
@@ -314,7 +319,7 @@ const ORPHAN_BATCH: usize = 256;
 /// Deletes names that no symbol or reference uses, so removed identifiers do not stay readable.
 pub(crate) fn delete_unused_names(conn: &Connection) -> Result<()> {
     const UNUSED: &str = "NOT EXISTS (SELECT 1 FROM symbols s WHERE s.name_id = n.id)
-        AND NOT EXISTS (SELECT 1 FROM refs r WHERE r.name_id = n.id)";
+        AND NOT EXISTS (SELECT 1 FROM ref_names r WHERE r.name_id = n.id)";
     conn.execute(
         &format!(
             "INSERT INTO names_fts (names_fts, rowid, name)
@@ -334,7 +339,25 @@ pub(crate) struct NewBlob {
     pub lines: i64,
     pub compressed: Vec<u8>,
     pub trigrams: Trigrams,
-    pub extraction: Extraction,
+    pub extraction: Extracted,
+}
+
+/// An extraction in the form the writer stores. The workers build it.
+#[derive(Debug, Default)]
+pub(crate) struct Extracted {
+    symbols: Vec<Symbol>,
+    refs: Grouped,
+    pub timed_out: bool,
+}
+
+impl From<Extraction> for Extracted {
+    fn from(extraction: Extraction) -> Self {
+        Self {
+            refs: Grouped::of(&extraction.refs),
+            symbols: extraction.symbols,
+            timed_out: extraction.timed_out,
+        }
+    }
 }
 
 /// Gaps first, so trigram blocks stay full.
@@ -375,6 +398,7 @@ pub(crate) fn insert_blob(
     ids: &mut BlobIds,
     names: &mut Names,
     trigrams: &mut Pending,
+    refs: &mut refs::Pending,
     blob: &NewBlob,
 ) -> Result<i64> {
     let id = ids.take();
@@ -391,25 +415,30 @@ pub(crate) fn insert_blob(
         blob.extraction.timed_out
     ])?;
     trigrams.add(conn, id, &blob.trigrams)?;
-    insert_extraction(conn, names, id, &blob.extraction)?;
+    insert_extraction(conn, names, refs, id, &blob.extraction)?;
     Ok(id)
 }
 
 pub(crate) fn insert_extraction(
     conn: &Connection,
     names: &mut Names,
+    refs: &mut refs::Pending,
     blob_id: i64,
-    extraction: &Extraction,
+    extraction: &Extracted,
 ) -> Result<()> {
-    let mut symbol_ids = Vec::with_capacity(extraction.symbols.len());
-    for symbol in &extraction.symbols {
+    // Explicit ids, so a reference can store its enclosing symbol as a place in this list.
+    let first_symbol: i64 = conn
+        .prepare_cached("SELECT coalesce(max(id), 0) + 1 FROM symbols")?
+        .query_row([], |row| row.get(0))?;
+    for (id, symbol) in (first_symbol..).zip(&extraction.symbols) {
         let name_id = names.id(conn, &symbol.name)?;
         conn.prepare_cached(
             "INSERT INTO symbols
-               (blob_id, name_id, kind, container, line, col, end_line, start_line)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+               (id, blob_id, name_id, kind, container, line, col, end_line, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?
         .execute(params![
+            id,
             blob_id,
             name_id,
             symbol.kind,
@@ -419,25 +448,13 @@ pub(crate) fn insert_extraction(
             symbol.end_line,
             symbol.start_line
         ])?;
-        symbol_ids.push(conn.last_insert_rowid());
     }
-    for reference in &extraction.refs {
-        let name_id = names.id(conn, &reference.name)?;
-        let enclosing = reference.enclosing.map(|index| symbol_ids[index]);
-        conn.prepare_cached(
-            // Two refs at one position with one name and kind say nothing more than one.
-            "INSERT OR IGNORE INTO refs (blob_id, line, col, name_id, kind, enclosing)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )?
-        .execute(params![
-            blob_id,
-            reference.line,
-            reference.col,
-            name_id,
-            reference.kind,
-            enclosing
-        ])?;
-    }
+    let name_ids: Vec<i64> = extraction
+        .refs
+        .names()
+        .map(|name| names.id(conn, name))
+        .collect::<Result<_>>()?;
+    refs.insert(conn, blob_id, first_symbol, &name_ids, &extraction.refs)?;
     Ok(())
 }
 
@@ -453,11 +470,12 @@ pub(crate) fn timed_out_blobs(conn: &Connection, max: i64) -> Result<Vec<i64>> {
 pub(crate) fn replace_extraction(
     conn: &Connection,
     names: &mut Names,
+    refs: &mut refs::Pending,
     blob_id: i64,
-    extraction: &Extraction,
+    extraction: &Extracted,
 ) -> Result<()> {
-    delete_extraction(conn, blob_id)?;
-    insert_extraction(conn, names, blob_id, extraction)?;
+    delete_extraction(conn, refs, blob_id)?;
+    insert_extraction(conn, names, refs, blob_id, extraction)?;
     conn.prepare_cached(
         "UPDATE blobs SET timeouts = CASE WHEN ?2 THEN timeouts + 1 ELSE 0 END WHERE id = ?1",
     )?
@@ -465,9 +483,8 @@ pub(crate) fn replace_extraction(
     Ok(())
 }
 
-fn delete_extraction(conn: &Connection, blob_id: i64) -> Result<()> {
-    conn.prepare_cached("DELETE FROM refs WHERE blob_id = ?1")?
-        .execute([blob_id])?;
+fn delete_extraction(conn: &Connection, refs: &mut refs::Pending, blob_id: i64) -> Result<()> {
+    refs.delete(conn, blob_id)?;
     conn.prepare_cached("DELETE FROM symbols WHERE blob_id = ?1")?
         .execute([blob_id])?;
     Ok(())
@@ -479,6 +496,27 @@ pub(crate) fn blob_text(conn: &Connection, blob_id: i64) -> Result<String> {
         .prepare_cached("SELECT content FROM blobs WHERE id = ?1")?
         .query_row([blob_id], |row| row.get(0))?;
     decompress(&compressed)
+}
+
+/// Blobs are about 8% smaller than at level 3, for about 3 times the CPU time. The threads that
+/// compress wait for the one writer most of the time.
+const COMPRESSION_LEVEL: i32 = 7;
+
+pub(crate) fn compress(bytes: &[u8]) -> Result<Vec<u8>> {
+    thread_local! {
+        // Creating a context costs more than encoding a typical file.
+        static CONTEXT: RefCell<zstd::zstd_safe::CCtx<'static>> =
+            RefCell::new(zstd::zstd_safe::CCtx::create());
+    }
+    let mut compressed = Vec::with_capacity(zstd::zstd_safe::compress_bound(bytes.len()));
+    CONTEXT
+        .with_borrow_mut(|context| context.compress(&mut compressed, bytes, COMPRESSION_LEVEL))
+        .map_err(|code| {
+            let name = zstd::zstd_safe::get_error_name(code);
+            Error::failure(format!("compression failed: {name}"))
+        })?;
+    compressed.shrink_to_fit();
+    Ok(compressed)
 }
 
 pub(crate) fn decompress(compressed: &[u8]) -> Result<String> {
@@ -533,7 +571,7 @@ pub(crate) fn counts(conn: &Connection) -> Result<Counts> {
                 (SELECT count(*) FROM files WHERE blob_id IS NOT NULL),
                 (SELECT count(*) FROM files f JOIN blobs b ON b.id = f.blob_id WHERE b.language IS NOT NULL),
                 (SELECT count(*) FROM symbols),
-                (SELECT count(*) FROM refs),
+                (SELECT coalesce(sum(count), 0) FROM refs),
                 (SELECT count(*) FROM files f JOIN blobs b ON b.id = f.blob_id WHERE b.timeouts > 0),
                 (SELECT count(*) FROM files WHERE flags & ?1)",
         [FileFlags::UNREADABLE],
@@ -660,23 +698,41 @@ mod tests {
             "INSERT INTO names VALUES (1, 'f', 'f');
              INSERT INTO symbols (blob_id, name_id, kind, line, col, end_line, start_line)
                VALUES (1, 1, 0, 1, 0, 1, 1);
-             INSERT INTO refs VALUES (1, 1, 0, 1, 0, NULL);",
+             INSERT INTO refs VALUES (1, 1, x'010103010000');
+             INSERT INTO ref_names VALUES (1, 1);",
         )
         .expect("insert extraction");
         let mut trigrams = Pending::new(&conn).expect("pending");
+        let mut refs = refs::Pending::default();
         assert_eq!(
-            delete_orphans(&conn, &mut trigrams, [1]).expect("delete"),
+            delete_orphans(&conn, &mut trigrams, &mut refs, [1]).expect("delete"),
             1
         );
         trigrams.finish(&conn).expect("finish");
+        refs.finish(&conn).expect("finish");
         let left: i64 = conn
             .query_row(
-                "SELECT (SELECT count(*) FROM symbols) + (SELECT count(*) FROM refs)",
+                "SELECT (SELECT count(*) FROM symbols) + (SELECT count(*) FROM refs)
+                   + (SELECT count(*) FROM ref_names)",
                 [],
                 |row| row.get(0),
             )
             .expect("count");
         assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn a_blob_with_refs_cannot_be_deleted_before_them() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conn = open(&dir.path().join("shard.sqlite")).expect("open shard");
+        conn.execute_batch(
+            "INSERT INTO blobs (id, key, lines, content) VALUES (1, x'01', 1, x'');
+             INSERT INTO names VALUES (1, 'f', 'f');
+             INSERT INTO refs VALUES (1, 1, x'0001020000');
+             INSERT INTO ref_names VALUES (1, 1);",
+        )
+        .expect("insert");
+        assert!(conn.execute("DELETE FROM blobs WHERE id = 1", []).is_err());
     }
 
     #[test]

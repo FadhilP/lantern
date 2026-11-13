@@ -17,8 +17,9 @@ use crate::home::{FOLDER_DEFAULTS, Home};
 use crate::language::{FileFlags, Language};
 use crate::limits::{self, MAX_PARSE_ATTEMPTS, RACY_SLACK_MS, REFRESH_ATTEMPTS};
 use crate::source::{Entry, Inventory, Scan, SourceKind};
+use crate::store::refs;
 use crate::store::remove_database;
-use crate::store::shard::{self, BlobIds, BlobKey, FileRow, Meta, Names, NewBlob};
+use crate::store::shard::{self, BlobIds, BlobKey, Extracted, FileRow, Meta, Names, NewBlob};
 use crate::store::trigram::{Pending, Trigrams};
 
 /// Settings that decide eligibility and the refresh deadline.
@@ -529,15 +530,16 @@ impl Job<'_> {
         let mut names = Names::default();
         let mut ids = BlobIds::load(tx)?;
         let mut trigrams = Pending::new(tx)?;
+        let mut ref_names = refs::Pending::default();
         let mut counts = RefreshCounts::default();
         let mut results_changed = reextract
             || !retry.is_empty()
             || !diff.removed.is_empty()
             || !diff.flag_updates.is_empty();
         if reextract {
-            reextract_all(tx, &mut names, &mut counts)?;
+            reextract_all(tx, &mut names, &mut ref_names, &mut counts)?;
         } else {
-            reextract_blobs(tx, &mut names, &mut counts, &retry)?;
+            reextract_blobs(tx, &mut names, &mut ref_names, &mut counts, &retry)?;
         }
 
         let mut rows: Vec<(&String, FileRow)> = Vec::with_capacity(diff.candidates.len());
@@ -557,8 +559,14 @@ impl Job<'_> {
                     if let Some(&id) = inserted.get(&blob.key) {
                         Some(id)
                     } else {
-                        let id =
-                            shard::insert_blob(tx, &mut ids, &mut names, &mut trigrams, &blob)?;
+                        let id = shard::insert_blob(
+                            tx,
+                            &mut ids,
+                            &mut names,
+                            &mut trigrams,
+                            &mut ref_names,
+                            &blob,
+                        )?;
                         inserted.insert(blob.key, id);
                         Some(id)
                     }
@@ -603,8 +611,9 @@ impl Job<'_> {
                 touched.extend(row.blob_id);
                 counts.removed += 1;
             }
-            let orphans = shard::delete_orphans(tx, &mut trigrams, touched)?;
+            let orphans = shard::delete_orphans(tx, &mut trigrams, &mut ref_names, touched)?;
             trigrams.finish(tx)?;
+            ref_names.finish(tx)?;
             if secure && orphans > 0 {
                 shard::delete_unused_names(tx)?;
             }
@@ -725,15 +734,14 @@ fn new_blob(language: Option<Language>, bytes: &[u8], text: &str, key: BlobKey) 
     let extraction = language.map_or_else(Extraction::default, |language| {
         extract::extract(language, text)
     });
-    let compressed = zstd::encode_all(bytes, 3)
-        .map_err(|error| Error::failure(format!("compression failed: {error}")))?;
+    let compressed = shard::compress(bytes)?;
     Ok(NewBlob {
         key,
         language: language.map(Language::name),
         lines: i64::try_from(text.lines().count()).unwrap_or(i64::MAX),
         compressed,
         trigrams: Trigrams::of(text),
-        extraction,
+        extraction: extraction.into(),
     })
 }
 
@@ -772,18 +780,24 @@ where
 const REEXTRACT_BATCH: usize = 256;
 
 /// Re-extracts every stored blob after an extractor change, without reading the disk.
-fn reextract_all(conn: &Connection, names: &mut Names, counts: &mut RefreshCounts) -> Result<()> {
+fn reextract_all(
+    conn: &Connection,
+    names: &mut Names,
+    ref_names: &mut refs::Pending,
+    counts: &mut RefreshCounts,
+) -> Result<()> {
     let ids: Vec<i64> = conn
         .prepare("SELECT id FROM blobs ORDER BY id")?
         .query_map([], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    reextract_blobs(conn, names, counts, &ids)
+    reextract_blobs(conn, names, ref_names, counts, &ids)
 }
 
 /// Re-extracts the given blobs from their stored content and language.
 fn reextract_blobs(
     conn: &Connection,
     names: &mut Names,
+    ref_names: &mut refs::Pending,
     counts: &mut RefreshCounts,
     ids: &[i64],
 ) -> Result<()> {
@@ -795,22 +809,22 @@ fn reextract_blobs(
                     .query_row([id], |row| Ok((id, row.get(0)?, row.get(1)?)))
             })
             .collect::<rusqlite::Result<_>>()?;
-        let extracted: Vec<(i64, Extraction)> = stored
+        let extracted: Vec<(i64, Extracted)> = stored
             .into_par_iter()
             .map(|(id, compressed, language)| {
                 let Some(language) = language else {
-                    return Ok((id, Extraction::default()));
+                    return Ok((id, Extracted::default()));
                 };
                 let language = Language::from_name(&language).ok_or_else(|| {
                     Error::failure(format!("unknown language in shard: {language}"))
                 })?;
                 let text = shard::decompress(&compressed)?;
-                Ok((id, extract::extract(language, &text)))
+                Ok((id, extract::extract(language, &text).into()))
             })
             .collect::<Result<_>>()?;
         for (id, extraction) in extracted {
             counts.parse_timeouts += u64::from(extraction.timed_out);
-            shard::replace_extraction(conn, names, id, &extraction)?;
+            shard::replace_extraction(conn, names, ref_names, id, &extraction)?;
         }
     }
     Ok(())

@@ -159,6 +159,39 @@ fn code_ranks_by_folded_counts_beyond_the_first_batch() {
 }
 
 #[test]
+fn code_matches_name_their_innermost_definition() {
+    let f = Fixture::new();
+    f.write(
+        "box.ts",
+        "// needle at the top\n\nclass Box {\n  open() {\n    return \"needle\";\n  }\n}\nfunction after() {\n  needle();\n}\nneedle;\n",
+    );
+    let text = f.text(&["code", "needle", "--per-file", "10"]);
+    assert_eq!(
+        text,
+        "box.ts\n1:// needle at the top\n  in method Box.open\n5:    return \"needle\";\n  in function after\n9:  needle();\n  not in a named definition\n11:needle;\n"
+    );
+    let text = f.text(&["code", "return", "--context", "2"]);
+    assert_eq!(
+        text,
+        "box.ts
+3-class Box {
+4-  open() {
+  in method Box.open
+5:    return \"needle\";
+6-  }
+7-}
+"
+    );
+    let found = f.ok(&["code", "needle", "--per-file", "10"]);
+    let matches = &found["results"][0]["matches"];
+    assert_eq!(matches[0].get("enclosing"), None);
+    assert_eq!(
+        matches[1]["enclosing"],
+        serde_json::json!({"name": "open", "container": "Box", "kind": "method"})
+    );
+}
+
+#[test]
 fn code_search_follows_edits_and_removals() {
     let f = Fixture::new();
     for index in 0..6 {
@@ -653,7 +686,7 @@ fn text_output_groups_by_file_and_starts_a_page_with_its_cursor() {
             "--sort",
             "path"
         ]),
-        "a.ts (3 matches, 1 shown)\n1:function load() {}\n2-function main() {\nb.ts\n1:load();\n"
+        "a.ts (3 matches, 1 shown)\n  in function load\n1:function load() {}\n2-function main() {\nb.ts\n1:load();\n"
     );
     let page = f.text(&["outline", "a.ts", "--limit", "1"]);
     let (more, first) = page
