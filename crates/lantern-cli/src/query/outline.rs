@@ -39,7 +39,7 @@ pub(crate) fn run(
     request: &PageRequest,
 ) -> Result<Outline> {
     validate_limit(request)?;
-    let full = paths::resolve_lexically(base, file)
+    let full = paths::resolve_lexically(base, &file.replace('\\', "/"))
         .filter(|full| !full.is_empty())
         .ok_or_else(|| Error::usage(format!("{file} is outside the workspace")))?;
     let stored: Option<(Option<i64>, Option<String>, u8)> = opened

@@ -75,11 +75,12 @@ pub(crate) fn from_dir(base: &str, full: &str) -> String {
     parts.join("/")
 }
 
-/// Resolves `input` (relative to the workspace directory `base`) lexically.
-/// Returns `None` when the result escapes the workspace.
+/// Resolves `/`-separated `input` (relative to the workspace directory `base`) lexically.
+/// Returns `None` when the result escapes the workspace. `\` is not a separator here: in a glob
+/// it escapes the next character.
 pub(crate) fn resolve_lexically(base: &str, input: &str) -> Option<String> {
     let mut parts: Vec<&str> = base.split('/').filter(|part| !part.is_empty()).collect();
-    for part in input.split(['/', '\\']) {
+    for part in input.split('/') {
         match part {
             "" | "." => {}
             ".." => {
