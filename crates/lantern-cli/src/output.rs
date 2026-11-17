@@ -9,7 +9,7 @@ use crate::extract::SymbolKind;
 use crate::git::FileStatus;
 use crate::query::Page;
 use crate::query::code::CodeHit;
-use crate::query::graph::Graph;
+use crate::query::graph::{Graph, SharedName};
 use crate::query::outline::{Outline, OutlineNode};
 use crate::query::refs::RefHit;
 use crate::query::symbols::SymbolHit;
@@ -361,12 +361,23 @@ fn outline_lines(nodes: &[OutlineNode], depth: usize, lines: &mut Vec<String>) {
     }
 }
 
-/// `-- truncated` first when cut, then nodes as `id kind name path:line`, then edges as
-/// `from -> to kind at line N` of the `from` node's file.
+/// `-- truncated` first when cut, and a line for names with several definitions; then nodes as
+/// `id kind name path:line`, then edges as `from -> to kind at line N` of the `from` node's file.
 fn graph_lines(graph: &Graph) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     if graph.truncated {
         lines.push("-- truncated".to_owned());
+    }
+    if !graph.shared_names.is_empty() && !graph.nodes.is_empty() {
+        let names: Vec<String> = graph
+            .shared_names
+            .iter()
+            .map(|SharedName { name, definitions }| format!("{name} ({definitions})"))
+            .collect();
+        lines.push(format!(
+            "-- shared names: {}; edges link by name, so one can mean another definition. Edges in the same file come first",
+            names.join(", ")
+        ));
     }
     lines.extend(graph.nodes.iter().map(|node| {
         let root = if graph.roots.contains(&node.id) {

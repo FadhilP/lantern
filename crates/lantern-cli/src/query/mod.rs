@@ -254,9 +254,22 @@ impl PathFilter {
                 Some(excluded) => (&mut filter.excludes, excluded),
                 None => (&mut filter.includes, glob.as_str()),
             };
-            list.push(compile_path_glob(glob, cwd_scope)?);
-            if let Some(inside) = inside_folder(glob) {
-                list.push(compile_path_glob(&inside, cwd_scope)?);
+            // One reading of an ambiguous glob may not compile, such as `a\[b` read with `\`
+            // as a separator; the value fails only when no reading compiles.
+            let mut first_error = None;
+            let before = list.len();
+            for text in glob_readings(glob) {
+                match compile_path_glob(&text, cwd_scope) {
+                    Ok(matcher) => list.push(matcher),
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            if list.len() == before
+                && let Some(error) = first_error
+            {
+                return Err(error);
             }
         }
         Ok(filter)
@@ -273,12 +286,56 @@ impl PathFilter {
     }
 }
 
+/// The globs a `--path` value can mean: as written, the folder it names, and with brackets and
+/// braces as text. On Windows `\` is a separator, so `\[` is read both as a separator and as an
+/// escape.
+fn glob_readings(glob: &str) -> Vec<String> {
+    let mut bases = Vec::new();
+    if cfg!(windows) {
+        bases.push(glob.replace('\\', "/"));
+        bases.extend(without_bracket_escapes(glob));
+    } else {
+        bases.push(glob.to_owned());
+    }
+    let mut readings = Vec::new();
+    for base in bases {
+        readings.extend(inside_folder(&base));
+        if let Some(literal) = brackets_as_text(&base) {
+            readings.push(literal);
+            let names_folder = !base.contains(['*', '?']);
+            if names_folder && let Some(folder) = folder_glob(&base) {
+                readings.push(brackets_as_text(&folder).unwrap_or(folder));
+            }
+        }
+        readings.push(base);
+    }
+    readings
+}
+
+/// `app\[id\]` as `app[id]`, for `brackets_as_text`. Windows names cannot hold `*` or `?`, so
+/// only brackets and braces need an escape.
+fn without_bracket_escapes(glob: &str) -> Option<String> {
+    let escapes = [r"\[", r"\]", r"\{", r"\}"];
+    if !escapes.iter().any(|escape| glob.contains(escape)) {
+        return None;
+    }
+    let mut text = glob.to_owned();
+    for escape in escapes {
+        text = text.replace(escape, &escape[1..]);
+    }
+    Some(text)
+}
+
 /// A value without glob syntax can name a folder, as in `--path src`; the folder's files then
 /// match too. Without a `/`, the folder matches at any depth, like any glob without one.
 fn inside_folder(glob: &str) -> Option<String> {
     if glob.contains(['*', '?', '[', '{']) {
         return None;
     }
+    folder_glob(glob)
+}
+
+fn folder_glob(glob: &str) -> Option<String> {
     let folder = glob.trim_end_matches(['/', '\\']);
     if folder.is_empty() {
         return None;
@@ -289,6 +346,28 @@ fn inside_folder(glob: &str) -> Option<String> {
     } else {
         Some(format!("**/{folder}/**"))
     }
+}
+
+/// Folder names such as Next.js `[id]` and `[...path]` are text, not a character class. A
+/// character after `\` is already escaped and stays as it is.
+fn brackets_as_text(glob: &str) -> Option<String> {
+    if !glob.contains(['[', ']', '{', '}']) {
+        return None;
+    }
+    let mut text = String::with_capacity(glob.len() + 8);
+    let mut escaped = false;
+    for c in glob.chars() {
+        let bracket = matches!(c, '[' | ']' | '{' | '}');
+        if bracket && !escaped {
+            text.push('[');
+            text.push(c);
+            text.push(']');
+        } else {
+            text.push(c);
+        }
+        escaped = c == '\\' && !escaped;
+    }
+    Some(text)
 }
 
 fn compile_path_glob(glob: &str, cwd_scope: &str) -> Result<GlobMatcher> {

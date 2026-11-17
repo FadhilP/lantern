@@ -65,7 +65,7 @@ Each query opens the shard read-only in one read transaction. Every statement of
 - `symbols`: candidates from the trigram name index, a case-insensitive prefix range, and an initials range; ranked in Rust by match tier (exact, prefix, initials, substring), then word start, then name length. Each file on the page is decompressed once for the signatures, and with `--body` for the lines from the stored start line, where decorators and doc comments start.
 - `code`: literals extracted from the pattern select candidates (small alternations and character classes, including `(?i)` case variants, expand to whole literals) from the trigram index; candidates are decompressed and matched line by line in parallel. A file scores `n / (n + 1)` for each distinct literal it holds `n` times, so each repeat adds less than the one before. The index gives each candidate an upper bound of that score; candidates are checked in bound order, and a file goes on the page once no unchecked candidate can rank before it.
 - `refs`: an exact name lookup with the enclosing definition.
-- `graph`: a breadth-first expansion over calls, resolved by name.
+- `graph`: a breadth-first expansion over calls and value uses, resolved by name.
 - `outline`: one file's symbols, nested by line range and by container.
 
 ## Changes

@@ -12,7 +12,6 @@ use super::{
 use crate::error::Result;
 use crate::extract::{SymbolKind, truncate_chars};
 use crate::language::FileFlags;
-use crate::limits::MAX_BODY_LINES;
 use crate::store::shard::{self, initials};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -24,8 +23,8 @@ pub struct SymbolQuery {
     pub language: Option<String>,
     pub path: Vec<String>,
     pub include_generated: bool,
-    /// Adds the source lines of each definition.
-    pub body: bool,
+    /// Adds at most this many source lines of each definition.
+    pub body_lines: Option<u32>,
     /// When a name matches exactly (in any case), drops the prefix, initials, and substring
     /// matches, and counts them in [`SymbolsFound::hidden_near_misses`].
     pub exact_only: bool,
@@ -48,7 +47,7 @@ pub struct SymbolHit {
 }
 
 /// Source lines from the first decorator, attribute, or doc comment to `end_line`, at most
-/// `MAX_BODY_LINES`.
+/// `--body N` lines.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Body {
     /// The first line of `text`; at or before the row's `line`.
@@ -104,7 +103,7 @@ pub(crate) fn run(
     };
     // Only the page's own rows are shown; the rest need no text.
     let shown = rows.iter_mut().skip(needed.offset).take(request.limit);
-    add_text(opened, shown, query.body, request.line_chars)?;
+    add_text(opened, shown, query.body_lines, request.line_chars)?;
     let page = opened.page(
         &description,
         request,
@@ -298,12 +297,12 @@ fn keep_in_container(rows: &mut Vec<Row>, name: &str, container: &str) -> Vec<St
     others
 }
 
-/// Fills each row's signature, and with `body` its body from the stored start line, reading each
-/// file once.
+/// Fills each row's signature, and with `body_lines` its body from the stored start line, reading
+/// each file once.
 fn add_text<'row>(
     opened: &Opened,
     rows: impl Iterator<Item = &'row mut Row>,
-    body: bool,
+    body_lines: Option<u32>,
     line_chars: usize,
 ) -> Result<()> {
     let mut rows_of: HashMap<i64, Vec<&mut Row>> = HashMap::new();
@@ -315,11 +314,11 @@ fn add_text<'row>(
         let lines: Vec<&str> = text.lines().collect();
         for row in rows {
             row.hit.signature = signature(&lines, row.hit.line, line_chars);
-            if !body {
+            let Some(body_lines) = body_lines else {
                 continue;
-            }
+            };
             let first = row.start_line;
-            let last = row.hit.end_line.min(first + MAX_BODY_LINES - 1);
+            let last = row.hit.end_line.min(first + body_lines - 1);
             let text = (first..=last)
                 .map(|line| truncate_chars(line_at(&lines, line), line_chars))
                 .collect();

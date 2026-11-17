@@ -13,7 +13,7 @@ use rusqlite::{Connection, ErrorCode, OpenFlags};
 
 use crate::error::{Error, Result};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Opens a database with the shared pragmas and runs `schema` when `user_version` is 0.
 fn open(path: &Path, schema: &str) -> Result<Connection> {

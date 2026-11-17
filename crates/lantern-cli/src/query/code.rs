@@ -10,7 +10,9 @@ use regex_syntax::hir::{Class, Hir, HirKind};
 use serde::Serialize;
 
 use super::refs::Enclosing;
-use super::{Opened, Page, PageRequest, PathFilter, language_names, validate_limit, validate_text};
+use super::{
+    Needed, Opened, Page, PageRequest, PathFilter, language_names, validate_limit, validate_text,
+};
 use crate::error::{Error, Result};
 use crate::extract::truncate_chars;
 use crate::language::FileFlags;
@@ -104,11 +106,7 @@ const MAX_VERIFY_BATCH: usize = 4096;
 /// Up to this many candidate blobs, looking up their files beats a scan of all files.
 const FILE_LOOKUPS: usize = 1024;
 
-pub(crate) fn run(
-    opened: &Opened,
-    query: &CodeQuery,
-    request: &PageRequest,
-) -> Result<Page<CodeHit>> {
+pub(crate) fn run(opened: &Opened, query: &CodeQuery, request: &PageRequest) -> Result<CodeFound> {
     validate_text("the pattern", &query.pattern)?;
     validate_limit(request)?;
     if query.per_file > MAX_PER_FILE {
@@ -116,96 +114,155 @@ pub(crate) fn run(
             "--per-file must be at most {MAX_PER_FILE}"
         )));
     }
-    // Clamped, not rejected: the docs promise "up to", and an error costs the caller a turn.
-    let context = query.context.min(MAX_CONTEXT);
     let filter = PathFilter::new(&query.path, &opened.scope)?;
     let languages = language_names(query.language.as_deref())?;
-    let source = if query.regex {
-        query.pattern.clone()
-    } else {
-        regex::escape(&query.pattern)
-    };
-    let matcher = RegexBuilder::new(&source)
-        .case_insensitive(!query.case_sensitive)
-        .multi_line(true)
-        .crlf(true)
-        .build()
-        .map_err(|error| {
-            Error::usage(format!(
-                "invalid regex: {error}{}",
-                regex_error_hint(&source)
-            ))
-        })?;
     let description = format!("code:{query:?}:{}", opened.scope);
     let needed = opened.needed(&description, request)?;
-    let need = need_of(&query.pattern, query.regex);
-    let scored = match query.sort {
-        CodeSort::Relevance => need.literals(),
-        CodeSort::Path => Vec::new(),
+    let search = Search {
+        opened,
+        query,
+        request,
+        filter: &filter,
+        languages: languages.as_deref(),
+        needed,
     };
-    let candidates = candidates(opened, query, &need, &scored, &filter, languages.as_deref())?;
+    let mut hits = search.hits(&query.pattern, query.regex)?;
+    let mut alternatives = Vec::new();
+    if hits.is_empty()
+        && let Some(parts) = literal_alternatives(query)
+    {
+        let source: Vec<String> = parts.iter().map(|part| regex::escape(part)).collect();
+        hits = search.hits(&source.join("|"), true)?;
+        alternatives = parts;
+    }
+    Ok(CodeFound {
+        page: opened.page(&description, request, &filter, hits)?,
+        alternatives,
+    })
+}
 
-    // A verified file is final once no unverified candidate can rank before it.
-    let mut verified: HashMap<i64, Option<FileMatches>> = HashMap::new();
-    let mut ready: Vec<(Rank, i64, FileMatches)> = Vec::new();
-    let mut hits: Vec<(i64, CodeHit)> = Vec::new();
-    let mut next = 0;
-    while hits.len() < needed.rows {
-        let best = (0..ready.len()).min_by(|&a, &b| ready[a].0.order(&ready[b].0));
-        let settled = best.filter(|&at| {
-            candidates
-                .get(next)
-                .is_none_or(|bound| ready[at].0.order(&bound.rank) != Ordering::Greater)
-        });
-        if let Some(at) = settled {
-            let (rank, blob_id, found) = ready.swap_remove(at);
-            hits.push((
-                blob_id,
-                CodeHit {
-                    path: rank.path,
-                    match_count: found.match_count,
-                    matches: found.matches,
-                },
-            ));
-            continue;
-        }
-        if next == candidates.len() {
-            break;
-        }
-        // Doubling keeps a search with few hits to a few rounds; each missing row needs a file.
-        let size = VERIFY_BATCH
-            .max(next)
-            .max(needed.rows - hits.len())
-            .min(MAX_VERIFY_BATCH);
-        let batch = &candidates[next..(next + size).min(candidates.len())];
-        verify(opened, batch, &mut verified, |text| {
-            let mut found = search(text, &matcher, query.per_file, context, request.line_chars)?;
-            if !scored.is_empty() {
-                let text = trigram::folded(text);
-                found.score = score(
-                    scored
-                        .iter()
-                        .map(|literal| trigram::occurrences(&text, literal)),
-                );
-            }
-            Some(found)
-        })?;
-        for candidate in batch {
-            if let Some(found) = &verified[&candidate.blob_id] {
-                let rank = Rank {
-                    score: found.score,
-                    ..candidate.rank.clone()
-                };
-                ready.push((rank, candidate.blob_id, found.clone()));
-            }
-        }
-        next += batch.len();
+/// A page of `code` results.
+#[derive(Debug)]
+pub struct CodeFound {
+    pub page: Page<CodeHit>,
+    /// The parts of a literal `a|b` pattern that were searched as alternatives, because the
+    /// whole text matched nothing.
+    pub alternatives: Vec<String>,
+}
+
+/// Agents write `a|b` without `--regex` about one call in five, expecting alternation. Grep's
+/// `a\|b` keeps its own hint.
+fn literal_alternatives(query: &CodeQuery) -> Option<Vec<String>> {
+    if query.regex || query.pattern.contains(r"\|") {
+        return None;
     }
-    for (blob_id, hit) in hits.iter_mut().skip(needed.offset).take(request.limit) {
-        name_enclosing(opened, *blob_id, &mut hit.matches)?;
+    let parts: Vec<String> = query.pattern.split('|').map(str::to_owned).collect();
+    let all_filled = parts.iter().all(|part| !part.is_empty());
+    let reads_as_alternation =
+        Regex::new(r"[^\s|]\|[^\s|]").is_ok_and(|syntax| syntax.is_match(&query.pattern));
+    (all_filled && reads_as_alternation).then_some(parts)
+}
+
+struct Search<'a> {
+    opened: &'a Opened,
+    query: &'a CodeQuery,
+    request: &'a PageRequest,
+    filter: &'a PathFilter,
+    languages: Option<&'a [&'a str]>,
+    needed: Needed,
+}
+
+impl Search<'_> {
+    /// The sorted hits up to the end of the page, with the page's definitions named.
+    fn hits(&self, pattern: &str, regex: bool) -> Result<Vec<CodeHit>> {
+        let (opened, query, request) = (self.opened, self.query, self.request);
+        // Clamped, not rejected: the docs promise "up to", and an error costs the caller a turn.
+        let context = query.context.min(MAX_CONTEXT);
+        let needed = self.needed;
+        let source = if regex {
+            pattern.to_owned()
+        } else {
+            regex::escape(pattern)
+        };
+        let matcher = RegexBuilder::new(&source)
+            .case_insensitive(!query.case_sensitive)
+            .multi_line(true)
+            .crlf(true)
+            .build()
+            .map_err(|error| {
+                Error::usage(format!(
+                    "invalid regex: {error}{}",
+                    regex_error_hint(&source)
+                ))
+            })?;
+        let need = need_of(pattern, regex);
+        let scored = match query.sort {
+            CodeSort::Relevance => need.literals(),
+            CodeSort::Path => Vec::new(),
+        };
+        let candidates = candidates(opened, query, &need, &scored, self.filter, self.languages)?;
+
+        // A verified file is final once no unverified candidate can rank before it.
+        let mut verified: HashMap<i64, Option<FileMatches>> = HashMap::new();
+        let mut ready: Vec<(Rank, i64, FileMatches)> = Vec::new();
+        let mut hits: Vec<(i64, CodeHit)> = Vec::new();
+        let mut next = 0;
+        while hits.len() < needed.rows {
+            let best = (0..ready.len()).min_by(|&a, &b| ready[a].0.order(&ready[b].0));
+            let settled = best.filter(|&at| {
+                candidates
+                    .get(next)
+                    .is_none_or(|bound| ready[at].0.order(&bound.rank) != Ordering::Greater)
+            });
+            if let Some(at) = settled {
+                let (rank, blob_id, found) = ready.swap_remove(at);
+                hits.push((
+                    blob_id,
+                    CodeHit {
+                        path: rank.path,
+                        match_count: found.match_count,
+                        matches: found.matches,
+                    },
+                ));
+                continue;
+            }
+            if next == candidates.len() {
+                break;
+            }
+            // Doubling keeps a search with few hits to a few rounds; each missing row needs a file.
+            let size = VERIFY_BATCH
+                .max(next)
+                .max(needed.rows - hits.len())
+                .min(MAX_VERIFY_BATCH);
+            let batch = &candidates[next..(next + size).min(candidates.len())];
+            verify(opened, batch, &mut verified, |text| {
+                let mut found = find(text, &matcher, query.per_file, context, request.line_chars)?;
+                if !scored.is_empty() {
+                    let text = trigram::folded(text);
+                    found.score = score(
+                        scored
+                            .iter()
+                            .map(|literal| trigram::occurrences(&text, literal)),
+                    );
+                }
+                Some(found)
+            })?;
+            for candidate in batch {
+                if let Some(found) = &verified[&candidate.blob_id] {
+                    let rank = Rank {
+                        score: found.score,
+                        ..candidate.rank.clone()
+                    };
+                    ready.push((rank, candidate.blob_id, found.clone()));
+                }
+            }
+            next += batch.len();
+        }
+        for (blob_id, hit) in hits.iter_mut().skip(needed.offset).take(request.limit) {
+            name_enclosing(opened, *blob_id, &mut hit.matches)?;
+        }
+        Ok(hits.into_iter().map(|(_, hit)| hit).collect())
     }
-    let hits = hits.into_iter().map(|(_, hit)| hit).collect();
-    opened.page(&description, request, &filter, hits)
 }
 
 /// A definition's decorators and doc comments count as inside it.
@@ -384,7 +441,7 @@ fn regex_error_hint(pattern: &str) -> String {
 
 /// Line-oriented matching, like `rg`: a match never spans lines. Context windows of nearby
 /// matches do not overlap, so each line is shown once. `per_file` 0 only counts.
-fn search(
+fn find(
     text: &str,
     matcher: &Regex,
     per_file: usize,

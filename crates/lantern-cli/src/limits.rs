@@ -23,8 +23,9 @@ pub(crate) const MAX_LINE_CHARS: usize = 500;
 /// Longest line text in the default text output; agents cut wider lines to about 130.
 pub(crate) const TEXT_LINE_CHARS: usize = 200;
 pub(crate) const MAX_SIGNATURE_CHARS: usize = 300;
-/// Longest body, in lines, that `symbols --body` prints per definition.
-pub(crate) const MAX_BODY_LINES: u32 = 100;
+/// Body lines that `symbols --body` prints per definition, and the most that `--body N` takes.
+pub(crate) const DEFAULT_BODY_LINES: u32 = 100;
+pub(crate) const MAX_BODY_LINES: u32 = 1000;
 /// A NUL byte in this prefix marks a file as binary.
 pub(crate) const TEXT_SNIFF_BYTES: usize = 8 * 1024;
 pub(crate) const MAX_RULE_FILE_BYTES: u64 = 4 << 20;

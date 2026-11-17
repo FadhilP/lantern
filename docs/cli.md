@@ -6,10 +6,10 @@ lantern [GLOBAL OPTIONS] <COMMAND>
 lantern index   [PATH] [--rebuild] [--force]
 lantern status  [PATH]
 lantern prune
-lantern symbols [query]...[--kind K,...] [--language L] [--path GLOB]... [--include-generated] [--body] [--fuzzy]
+lantern symbols [query]...[--kind K,...] [--language L] [--path GLOB]... [--include-generated] [--body [N]] [--fuzzy]
 lantern code    <pattern> | -e <pattern> [--regex] [--case-sensitive] [--path GLOB]... [--language L]
                           [--per-file N | -l] [--context N] [--sort relevance|path] [--include-generated]
-lantern refs    <name>    [--kind call|type|import|implementation,...] [--path GLOB]... [--include-generated]
+lantern refs    <name>... [--kind call|type|import|implementation|value,...] [--path GLOB]... [--include-generated]
 lantern graph   <name>    [--direction callers|callees|both] [--depth N] [--max-nodes N]
                           [--kind K,...] [--path GLOB]... [--include-generated] [--stale-ok] [--max-bytes N]
 lantern outline <file>...
@@ -86,7 +86,7 @@ Search over definitions by exact name, prefix, initials, or substring; a query w
 - A constructor shares its type's name. When the type's row is in the results, the constructor row is left out, since the type's row spans it. `--kind method` or `Type.Type` finds the constructor.
 - When a name matches the query exactly (in any case), only the exact matches are shown. A first text line `-- more: --fuzzy (N)`, or `fuzzy_hidden` in JSON, counts the prefix, initials, and substring matches it hid. `--fuzzy` lists them after the exact matches. With no exact match, they are always listed.
 - `Container.name` or `Container::name` narrows to definitions inside that container (case-insensitive).
-- `--body` adds the source lines of each definition, up to 100 lines, to `end_line`. A body starts at the first decorator, attribute, annotation, or doc comment right before the definition (a blank line ends them), so it can start before the row's `line`. The start is stored in the index, so a body needs no second parse. The default limit drops to 5.
+- `--body [N]` adds the source lines of each definition, up to N lines (default 100, at most 1000), to `end_line`. A body starts at the first decorator, attribute, annotation, or doc comment right before the definition (a blank line ends them), so it can start before the row's `line`. The start is stored in the index, so a body needs no second parse. The default limit drops to 5.
 - `--kind`: `function`, `method`, `class`, `interface`, `struct`, `enum`, `trait`, `type`, `module`, `constant`, `variable`, `field`. Separate several with commas (`--kind class,interface`).
 - `--language`: `c`, `cpp`, `csharp`, `dart`, `go`, `java`, `javascript` (includes `.jsx` files), `php`, `python`, `ruby`, `rust`, `typescript` (also selects `tsx`), `tsx`.
 
@@ -94,7 +94,7 @@ Row: `name, kind, container, path, line, end_line, signature, body?`. `body` is 
 
 ### `code <pattern>`
 
-Line search. The pattern is a literal unless `--regex` is set (Rust `regex` syntax). Matching is case-insensitive unless `--case-sensitive` is set. A regex matches within one line. Alternation is `a|b`; grep's `a\|b` matches a literal `|`.
+Line search. The pattern is a literal unless `--regex` is set (Rust `regex` syntax). Matching is case-insensitive unless `--case-sensitive` is set. A regex matches within one line. Alternation is `a|b`; grep's `a\|b` matches a literal `|`. A literal pattern with `|` between two characters other than spaces (`load|save`, not `a | b` or `a\|b`) that matches nothing is searched again with each part between `|` as a literal alternative. The page then has `"alternatives": [parts]`, and the text output has a line `-- no literal match; ...`. The cursor of such a page resumes the same search.
 
 - `-e <pattern>` gives the pattern as an option, also when it starts with `-` (`-e --flag`).
 - `-i` is accepted and changes nothing, since matching already ignores case.
@@ -105,15 +105,15 @@ Line search. The pattern is a literal unless `--regex` is set (Rust `regex` synt
 
 Row (one per file): `path, match_count, matches: [{line, column, text, before?, after?, enclosing?: {name, container?, kind}}]`. `column` is a 1-based byte column. Line text is cut at 200 characters in text output and at 500 in JSON, and a cut line ends with `…`. The same cap applies to `refs` text, `symbols` bodies, and signatures (at most 300). When a match starts too late to show, the match line starts with `…` and shows a window from a fifth of the cap (40 or 100 characters) before the match. Default limit 10 files.
 
-### `refs <name>`
+### `refs <name>...`
 
-References to an exact, case-sensitive name. `--kind call|type|import|implementation` filters them; separate several with commas (`--kind call,import`). Every language records `call` references. `type` references cover every type use in Dart, Go, and TypeScript/TSX; in C#, C++, Java, JavaScript, and PHP they cover only `new X` (C# also variable types and generic constraints). `import` references exist only for Dart and JavaScript/TypeScript/TSX. `implementation` references (base classes, interfaces, mixins, trait impls) exist in every language except C and Go. Find other type uses and imports with `lantern code`.
+References to an exact, case-sensitive name. With several names, each page follows a `== NAME` line in the text output; `--json` and `--cursor` take one name. `--kind call|type|import|implementation|value` filters them; separate several with commas (`--kind call,import`). Every language records `call` references. `type` references cover every type use in Dart, Go, Rust, and TypeScript/TSX; in C#, C++, Java, JavaScript, and PHP they cover only `new X` (C# also variable types and generic constraints). `import` references exist only for Dart and JavaScript/TypeScript/TSX. `implementation` references (base classes, interfaces, mixins, trait impls) exist in every language except C and Go. `value` references (JavaScript/TypeScript/TSX only) are a name passed or stored as a value, such as a callback in `onSave={save}`, `list.map(toOption)`, or `{ run: start }`; they are kept only for a name that the file defines or imports. Find other type uses and imports with `lantern code`.
 
 Row: `path, line, column, kind, text, enclosing`. `enclosing` is `{name, container, kind}` of the innermost definition around the reference; it is left out at the top level. The page has `"resolution": "name"`.
 
 ### `graph <name>`
 
-Callers and callees of a name, breadth-first. The graph follows only `call` references; use `refs` for type uses, imports, and implementations.
+Callers and callees of a name, breadth-first. The graph follows `call` and `value` references; an edge has the kind of its reference. Use `refs` for type uses, imports, and implementations.
 
 - Roots are the definitions of `name`; `--kind` and `--path` narrow them. Every match is a root. `Container.name` or `Container::name` keeps the definitions inside that container (case-insensitive).
 - `--direction callers`: calls to the name, grouped by their enclosing definition. A call outside any definition becomes a node of kind `file`.
@@ -128,7 +128,7 @@ Callers and callees of a name, breadth-first. The graph follows only `call` refe
  "unresolved":["fetchUser"]}
 ```
 
-An edge's `line` is in the file of its `from` node. `unresolved` lists called names with no definition in the workspace. A graph is not a list, so it has no `--limit` or `--cursor`.
+An edge's `line` is in the file of its `from` node. `unresolved` lists called names with no definition in the workspace. `shared_names: [{name, definitions}]` lists the root's name and the called names that more than one definition has: edges are found by name, so an edge to or from such a name can mean another definition. Callers in the root's file and callees in the caller's file come first, so `--max-nodes` cuts the others first. A graph is not a list, so it has no `--limit` or `--cursor`.
 
 ### `outline <file>...`
 
@@ -166,7 +166,7 @@ List results look like this:
 
 ## `--path`
 
-A glob relative to the current directory. Without a `/` it matches at any depth (`*.test.ts`). With a `/` it is anchored to the current directory (`src/**/*.rs`, `../lib/*`). It must stay inside the workspace. Repeat `--path` to match any of several globs (`--path 'src/**' --path 'lib/**'`). A value without glob characters also matches the files inside a folder of that name, by the same depth rule: `--path src` also matches `**/src/**`, and `--path lib/src` also matches `lib/src/**`. A glob that starts with `!` excludes its matches (`--path '!**/test/**'`). With only exclude globs, every other path passes. On Windows, `\` works as a separator.
+A glob relative to the current directory. Without a `/` it matches at any depth (`*.test.ts`). With a `/` it is anchored to the current directory (`src/**/*.rs`, `../lib/*`). It must stay inside the workspace. Repeat `--path` to match any of several globs (`--path 'src/**' --path 'lib/**'`). A value without glob characters also matches the files inside a folder of that name, by the same depth rule: `--path src` also matches `**/src/**`, and `--path lib/src` also matches `lib/src/**`. A glob that starts with `!` excludes its matches (`--path '!**/test/**'`). With only exclude globs, every other path passes. A glob with `[`, `]`, `{`, or `}` also matches with those characters read as text, so `--path 'app/[id]/**'` and `--path 'app/[id]'` find a Next.js `[id]` folder. On Windows, `\` works as a separator, so it cannot escape a glob character.
 
 ## Errors and exit codes
 
@@ -185,13 +185,13 @@ Errors go to stderr as `{"error":{"code":"...","message":"..."}}`, with the mess
 
 Without `--json`, list commands and `graph` print compact text for agents and people. Scripts should use `--json`; the text format can change. Each result line is one line: a control character other than tab inside it, such as a newline in a file name, prints escaped: `\n`, `\r`, `\u{1b}`.
 
-- `symbols`: `path:line-end_line kind[ in Container]: signature`, one per line. With `--body`, `line:text` lines follow, then `-- body cut: N more lines` when the body is longer than 100 lines.
+- `symbols`: `path:line-end_line kind[ in Container]: signature`, one per line. With `--body`, `line:text` lines follow, then `-- body cut: N more lines` when the body is longer than the line cap.
 - `code`: a heading line with the file path (`path (N matches, M shown)` when `--per-file` cut matches; `path (N matches)` with `-l`), then `line:text` for each match and `line-text` for `--context` lines. Where the innermost definition around the matches changes, an indented line right above the match names it: `  in kind Container.name`, or `  not in a named definition` after one ends (code in an anonymous function counts as outside). A definition's decorators and doc comments count as inside it. It names only the matches; `--context` lines can be in other definitions.
 - `refs`: a heading line with the file path, then `line:column kind[ in Container.name]: text` for each reference.
 - `outline`: `line-end_line kind name`, indented two spaces per nesting level.
 - `changes`: a heading line per file, `path (status, +added -removed, why unparsed)` with the parts that apply (`renamed from OLD`, `copied from OLD`). With `--diff`, the file's own `+line:text` and `-line:text` lines follow. Then `  status kind Container.name line-end_line (+added -removed)` per definition, with `from PATH:LINE` or `to PATH:LINE` before the counts for a moved one, and with `--diff` its lines.
 - `graph`: one line per node, `id kind Container.name path:line`, with roots marked `(root)`. Then one line per edge, `from -> to kind at line N`, where line N is in the file of the `from` node. Then `unresolved: ...`.
 - `no results` means nothing matched. With `--json`, an empty page or graph carries the same hint in a `hint` field. For `symbols`, `refs`, and `graph`, a hint follows with the `lantern code` command that finds the name as text, since fields, keys, and strings are not recorded as definitions or references. For `symbols Container.name` when other containers define the name, the hint lists them instead. For a literal `code` pattern with regex syntax (`a|b`, `getStats\(`), the hint says to add `--regex`. When the pattern has grep's `\|`, with or without `--regex`, the hint says to write `a|b`. For `outline`, a hint follows when no parser covers the file type (CSS, HTML), so a file with no symbols stays apart from a file Lantern cannot outline. When `--path` matches no indexed file, the hint says so: ignored files are not indexed. For `changes`, the hint says there are no changes, or no changed file or definition matches.
-- A first line `-- more: --cursor <value>` means more rows exist. `-- truncated` as the first line of a graph means `--max-nodes` or `--max-bytes` cut it. These lines come first, so `| head` cannot cut them off.
+- A first line `-- more: --cursor <value>` means more rows exist. `-- truncated` as the first line of a graph means `--max-nodes` or `--max-bytes` cut it. A graph line `-- shared names: X (N), ...` gives `shared_names`. These lines come first, so `| head` cannot cut them off.
 
 `index`, `status`, and `prune` print their report as indented JSON. Errors print as `lantern: <message>`. When `outline` gets a path that is not in the index, the error lists up to 5 indexed files with the same file name. For a folder, a usage error lists up to 10 indexed files in it. For a regex with an unclosed group, the error says to write `\(` for a literal `(`. `-C` takes a directory; `-C 3` with no directory `3` is a usage error that points to `--context 3`.

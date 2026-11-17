@@ -67,6 +67,8 @@
         (scoped_identifier name: (identifier) @name)
     ]) @reference.call
 
+((type_identifier) @name @reference.type (#not-eq? @name "Self"))
+
 ; implementations
 
 (impl_item

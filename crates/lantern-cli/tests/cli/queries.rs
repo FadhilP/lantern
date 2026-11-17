@@ -919,6 +919,145 @@ fn grep_alternation_and_a_literal_paren_in_a_regex_explain_themselves() {
 }
 
 #[test]
+fn a_literal_alternation_with_no_match_searches_its_parts_on_every_page() {
+    let f = Fixture::new();
+    f.write("a.ts", "loadUser();\n");
+    f.write("b.ts", "saveUser();\n");
+    f.write("c.ts", "const x = a | b;\n");
+    let args = [
+        "code",
+        "loadUser|saveUser",
+        "--sort",
+        "path",
+        "--limit",
+        "1",
+    ];
+    let first = f.ok(&args);
+    assert_eq!(crate::common::paths(&first), strings(&["a.ts"]));
+    assert_eq!(
+        first["alternatives"],
+        serde_json::json!(["loadUser", "saveUser"])
+    );
+    let cursor = first["next_cursor"].as_str().expect("cursor");
+    let second = f.ok(&[&args[..], &["--cursor", cursor]].concat());
+    assert_eq!(crate::common::paths(&second), strings(&["b.ts"]));
+    let text = f.text(&args);
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("-- no literal match")),
+        "{text}"
+    );
+
+    let spaced = f.ok(&["code", "a | b"]);
+    assert_eq!(crate::common::paths(&spaced), strings(&["c.ts"]));
+    assert!(spaced.get("alternatives").is_none());
+    let none = f.text(&["code", "zzqq|yyxx"]);
+    assert!(none.starts_with("no results, also for the parts"), "{none}");
+}
+
+#[test]
+fn refs_take_several_names() {
+    let f = graph_fixture();
+    let text = f.text(&["refs", "leaf", "root"]);
+    assert!(
+        text.contains("== leaf\na.ts\n") && text.contains("== root\nc.ts\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn path_globs_match_bracket_folders_as_text() {
+    let f = Fixture::new();
+    f.write("app/[id]/route.ts", "export const GET = 1;\n");
+    f.write("app/list/route.ts", "export const GET = 2;\n");
+    let mut globs = vec![
+        "app/[id]/route.ts",
+        "app/[id]",
+        "app/[id]/**",
+        r"app/\[id\]/route.ts",
+        r"app/\[id\]",
+    ];
+    if cfg!(windows) {
+        globs.extend([r"app\[id]\route.ts", r"app\[id]"]);
+    }
+    for glob in globs {
+        let found = f.ok(&["code", "GET", "--path", glob]);
+        assert_eq!(
+            crate::common::paths(&found),
+            strings(&["app/[id]/route.ts"]),
+            "{glob}"
+        );
+    }
+    let excluded = f.ok(&["code", "GET", "--path", "!app/[id]/**"]);
+    assert_eq!(
+        crate::common::paths(&excluded),
+        strings(&["app/list/route.ts"])
+    );
+}
+
+#[test]
+fn shared_names_are_named_and_edges_in_the_same_file_come_first() {
+    let f = Fixture::new();
+    f.write(
+        "a.ts",
+        "class A {\n  init() {}\n  start() { this.init(); }\n}\n",
+    );
+    f.write(
+        "b.ts",
+        "class B {\n  init() {}\n}\nfunction other(b: B) { b.init(); }\n",
+    );
+    let graph = f.ok(&[
+        "graph",
+        "B.init",
+        "--direction",
+        "callers",
+        "--max-nodes",
+        "2",
+    ]);
+    let shared = serde_json::json!([{"name": "init", "definitions": 2}]);
+    assert_eq!(graph["shared_names"], shared);
+    assert_eq!(edges(&graph), pairs(&[("other", "init")]));
+
+    let callees = f.ok(&[
+        "graph",
+        "other",
+        "--direction",
+        "callees",
+        "--max-nodes",
+        "2",
+    ]);
+    assert_eq!(callees["shared_names"], shared);
+    assert_eq!(callees["nodes"][1]["path"], "b.ts");
+}
+
+#[test]
+fn graph_follows_values_passed_as_callbacks() {
+    let f = Fixture::new();
+    f.write(
+        "page.tsx",
+        "function save() {}
+export function Page() {
+  return <Form onSave={save} />;
+}
+",
+    );
+    let callers = f.ok(&["graph", "save", "--direction", "callers"]);
+    assert_eq!(edges(&callers), pairs(&[("Page", "save")]));
+    assert_eq!(callers["edges"][0]["kind"], "value");
+    let callees = f.ok(&["graph", "Page", "--direction", "callees"]);
+    assert!(edges(&callees).contains(&("Page".to_owned(), "save".to_owned())));
+}
+
+#[test]
+fn body_takes_a_line_count() {
+    let f = Fixture::new();
+    f.write("a.ts", "export function long() {\n  one();\n  two();\n}\n");
+    let found = f.ok(&["symbols", "long", "--body", "2"]);
+    let text = found["results"][0]["body"]["text"].as_array().map(Vec::len);
+    assert_eq!(text, Some(2));
+}
+
+#[test]
 fn excluded_path_globs_drop_their_matches() {
     let f = Fixture::new();
     f.write("src/a.ts", "export const needle = 1;\n");

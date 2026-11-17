@@ -1,7 +1,7 @@
 //! Symbol and reference extraction with tree-sitter tag queries.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::{ControlFlow, Range};
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -98,6 +98,8 @@ pub enum RefKind {
     Type = 1,
     Import = 2,
     Implementation = 3,
+    /// A name passed or stored as a value, such as a callback; JavaScript and TypeScript only.
+    Value = 4,
 }
 
 impl RefKind {
@@ -108,6 +110,7 @@ impl RefKind {
             Self::Type => "type",
             Self::Import => "import",
             Self::Implementation => "implementation",
+            Self::Value => "value",
         }
     }
 
@@ -117,6 +120,7 @@ impl RefKind {
             "class" | "type" | "interface" => Self::Type,
             "implementation" => Self::Implementation,
             "import" | "module" => Self::Import,
+            "value" => Self::Value,
             _ => return None,
         };
         Some(kind)
@@ -450,8 +454,29 @@ impl Tags {
         });
     }
 
+    /// A value use counts only for a name the file defines or imports; the rest are locals and
+    /// parameters, which would fill the index.
+    fn keep_known_values(&mut self, source: &str) {
+        let text = |range: &Range<usize>| source[range.clone()].trim();
+        let known: HashSet<&str> = self
+            .definitions
+            .iter()
+            .map(|definition| text(&definition.name))
+            .chain(
+                self.references
+                    .iter()
+                    .filter(|reference| reference.kind == RefKind::Import)
+                    .map(|reference| text(&reference.name)),
+            )
+            .collect();
+        self.references.retain(|reference| {
+            reference.kind != RefKind::Value || known.contains(text(&reference.name))
+        });
+    }
+
     fn finish(mut self, source: &str) -> Extraction {
         self.dedup();
+        self.keep_known_values(source);
         self.definitions.sort_by_key(|definition| {
             (
                 definition.node.start,
@@ -779,6 +804,39 @@ mod tests {
                 ("Base", "implementation", Some("B")),
                 ("Def", "import", None),
             ])
+        );
+    }
+
+    #[test]
+    fn values_are_references_only_for_names_the_file_defines_or_imports() {
+        let source = "import { save } from \"./x\";\nfunction helper() {}\nfunction Page({ id }) {\n  const local = 1;\n  const pick = () => {};\n  use(helper, local, id);\n  return <Row onPick={pick} onSave={save} value={local} />;\n}\n";
+        let page = Some("Page".to_owned());
+        assert_eq!(
+            references(Language::Tsx, source),
+            vec![
+                ("save".to_owned(), "import", None),
+                ("use".to_owned(), "call", page.clone()),
+                ("helper".to_owned(), "value", page.clone()),
+                ("Row".to_owned(), "call", page.clone()),
+                ("pick".to_owned(), "value", page.clone()),
+                ("save".to_owned(), "value", page),
+            ]
+        );
+    }
+
+    #[test]
+    fn rust_type_uses_are_type_references() {
+        let source = "struct Mark { v: u8 }\nstruct Built { marks: Vec<Mark> }\nfn make() -> Mark { Mark { v: 0 } }\n";
+        let built = Some("Built".to_owned());
+        let make = Some("make".to_owned());
+        assert_eq!(
+            references(Language::Rust, source),
+            vec![
+                ("Vec".to_owned(), "type", built.clone()),
+                ("Mark".to_owned(), "type", built),
+                ("Mark".to_owned(), "type", make.clone()),
+                ("Mark".to_owned(), "type", make),
+            ]
         );
     }
 

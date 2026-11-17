@@ -29,8 +29,9 @@ use crate::engine::{Lantern, Options};
 use crate::error::{Error, ErrorKind};
 use crate::extract::{RefKind, SymbolKind};
 use crate::limits::{
-    DEFAULT_BODY_LIMIT, DEFAULT_CODE_LIMIT, DEFAULT_GRAPH_DEPTH, DEFAULT_GRAPH_NODES,
-    DEFAULT_LIMIT, DEFAULT_OUTLINE_LIMIT, DEFAULT_PER_FILE, MAX_LINE_CHARS, TEXT_LINE_CHARS,
+    DEFAULT_BODY_LIMIT, DEFAULT_BODY_LINES, DEFAULT_CODE_LIMIT, DEFAULT_GRAPH_DEPTH,
+    DEFAULT_GRAPH_NODES, DEFAULT_LIMIT, DEFAULT_OUTLINE_LIMIT, DEFAULT_PER_FILE, MAX_BODY_LINES,
+    MAX_LINE_CHARS, TEXT_LINE_CHARS,
 };
 use crate::output::Printer;
 use crate::query::code::{CodeQuery, CodeSort, looks_like_regex};
@@ -125,9 +126,10 @@ struct SymbolsArgs {
     path: Vec<String>,
     #[arg(long)]
     include_generated: bool,
-    /// Print the source lines of each definition; the default --limit drops to 5.
-    #[arg(long)]
-    body: bool,
+    /// Print the source lines of each definition, at most N (default 100); the default --limit
+    /// drops to 5.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=i64::from(MAX_BODY_LINES)))]
+    body: Option<Option<u32>>,
     /// Also list prefix, initials, and substring matches when a name matches exactly.
     #[arg(long)]
     fuzzy: bool,
@@ -175,7 +177,9 @@ struct CodeArgs {
 
 #[derive(Debug, Args)]
 struct RefsArgs {
-    name: String,
+    /// One or more names; each gets its own page under a `== NAME` line.
+    #[arg(required = true, value_name = "NAME")]
+    names: Vec<String>,
     /// One kind, or several separated by commas.
     #[arg(long, value_enum, value_delimiter = ',')]
     kind: Vec<RefKind>,
@@ -368,7 +372,7 @@ fn symbols(
             language: language.clone(),
             path: path.clone(),
             include_generated,
-            body,
+            body_lines: body.map(|lines| lines.unwrap_or(DEFAULT_BODY_LINES)),
             // Agents piped `symbols X | head -2` for the exact hit.
             exact_only: !fuzzy,
         };
@@ -435,7 +439,7 @@ fn symbols_page(
     freshness: Freshness,
     page: &PageArgs,
 ) -> Result<(), Error> {
-    let default_limit = if query.body {
+    let default_limit = if query.body_lines.is_some() {
         DEFAULT_BODY_LIMIT
     } else {
         DEFAULT_LIMIT
@@ -521,18 +525,37 @@ fn code(lantern: &Lantern, cwd: &Path, printer: &Printer, args: CodeArgs) -> Res
     )?;
     let note = incomplete_note(Incomplete {
         unparsed_files: 0,
-        ..found.incomplete
+        ..found.page.incomplete
     });
-    let empty = match code_empty(&query) {
+    let tried_alternatives = !found.alternatives.is_empty();
+    let empty = match code_empty(&query, tried_alternatives) {
         base if note.is_empty() => base.to_owned(),
         "no results" => format!("no results;{note}"),
         base => format!("{base}.{note}"),
     };
-    printer.page(&found, page.max_bytes, &[], &empty, output::code_lines)
+    let extra = if tried_alternatives {
+        vec![("alternatives", serde_json::json!(found.alternatives))]
+    } else {
+        Vec::new()
+    };
+    printer.page(&found.page, page.max_bytes, &extra, &empty, |hits| {
+        let mut lines = output::code_lines(hits);
+        if tried_alternatives && !hits.is_empty() {
+            lines.insert(
+                0,
+                "-- no literal match; these are matches of the parts between `|`, as alternatives"
+                    .to_owned(),
+            );
+        }
+        lines
+    })
 }
 
 /// The text for no matches. `a\|b` is grep's alternation; in Rust regex `\|` is a literal `|`.
-fn code_empty(query: &CodeQuery) -> &'static str {
+fn code_empty(query: &CodeQuery, tried_alternatives: bool) -> &'static str {
+    if tried_alternatives {
+        return "no results, also for the parts between `|` as alternatives";
+    }
     let grep_alternation = query.pattern.contains("\\|");
     if query.regex && grep_alternation {
         return "no results; in --regex, `\\|` matches a literal `|`. For alternation, write `a|b`";
@@ -574,31 +597,34 @@ fn changes(
 }
 
 fn refs(lantern: &Lantern, cwd: &Path, printer: &Printer, args: RefsArgs) -> Result<(), Error> {
-    let query = RefsQuery {
-        name: args.name,
-        kind: args.kind,
-        path: args.path,
-        include_generated: args.include_generated,
-    };
-    let found = lantern.refs(
-        cwd,
-        &query,
-        freshness(args.page.stale_ok),
-        &args.page.request(DEFAULT_LIMIT, printer.json()),
-    )?;
-    let extra = [("resolution", serde_json::json!("name"))];
-    let note = incomplete_note(found.incomplete);
-    let empty = format!(
-        "no results; refs records calls, types, imports, and implementations by exact, case-sensitive name. For a field, a key, or text, try: lantern code \"{}\"{note}",
-        query.name
-    );
-    printer.page(
-        &found,
-        args.page.max_bytes,
-        &extra,
-        &empty,
-        output::ref_lines,
-    )
+    let RefsArgs {
+        names,
+        kind,
+        path,
+        include_generated,
+        page,
+    } = args;
+    for_each_query(printer, &page, names, |name, freshness| {
+        let query = RefsQuery {
+            name,
+            kind: kind.clone(),
+            path: path.clone(),
+            include_generated,
+        };
+        let found = lantern.refs(
+            cwd,
+            &query,
+            freshness,
+            &page.request(DEFAULT_LIMIT, printer.json()),
+        )?;
+        let extra = [("resolution", serde_json::json!("name"))];
+        let note = incomplete_note(found.incomplete);
+        let empty = format!(
+            "no results; refs records calls, types, imports, and implementations by exact, case-sensitive name. For a field, a key, or text, try: lantern code \"{}\"{note}",
+            query.name
+        );
+        printer.page(&found, page.max_bytes, &extra, &empty, output::ref_lines)
+    })
 }
 
 fn graph(lantern: &Lantern, cwd: &Path, printer: &Printer, args: GraphArgs) -> Result<(), Error> {

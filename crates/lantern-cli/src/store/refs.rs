@@ -13,8 +13,8 @@ use super::{put_varint, take_varint};
 use crate::error::{Error, Result};
 use crate::extract::{RefKind, Reference};
 
-/// Enough for four kinds; a fifth needs a schema version.
-const KIND_BITS: u32 = 2;
+/// Enough for eight kinds; a ninth needs a schema version.
+const KIND_BITS: u32 = 3;
 
 /// A blob's references, grouped by name and encoded. The writer adds the ids.
 #[derive(Debug, Default)]
@@ -264,6 +264,7 @@ mod tests {
 
     #[test]
     fn a_row_round_trips_every_kind_and_drops_a_repeat() {
+        let kinds = RefKind::value_variants().len();
         let mut refs: Vec<Reference> = RefKind::value_variants()
             .iter()
             .zip(1..)
@@ -273,7 +274,7 @@ mod tests {
         refs.push(reference("used", RefKind::Call, 300, None));
         let grouped = Grouped::of(&refs);
         assert_eq!(grouped.names().collect::<Vec<_>>(), ["used", "other"]);
-        assert_eq!(grouped.count, 5);
+        assert_eq!(grouped.count, kinds as i64 + 1);
 
         let dir = tempfile::tempdir().expect("temp dir");
         let conn = super::super::shard::open(&dir.path().join("shard.sqlite")).expect("open");
@@ -288,7 +289,7 @@ mod tests {
                 row.get(0)
             })
             .expect("row");
-        let expected: Vec<Ref> = refs[..4]
+        let expected: Vec<Ref> = refs[..kinds]
             .iter()
             .map(|reference| Ref {
                 line: reference.line,
@@ -299,9 +300,9 @@ mod tests {
             .collect();
         assert_eq!(of_name(&stored, 5).expect("decode"), expected);
         let all = of_blob(&conn, 9).expect("decode");
-        assert_eq!(all.len(), 5);
+        assert_eq!(all.len(), kinds + 1);
         assert_eq!(
-            all[4],
+            all[kinds],
             (
                 6,
                 Ref {

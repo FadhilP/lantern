@@ -104,6 +104,17 @@
 (namespace_import (identifier) @name) @reference.import
 (export_statement (export_clause (export_specifier name: (identifier) @name)) source: (_)) @reference.import
 
+; a name passed or stored as a value, such as a callback; extract.rs keeps only names the file
+; defines or imports
+(arguments (identifier) @name @reference.value)
+(pair value: (identifier) @name @reference.value)
+(shorthand_property_identifier) @name @reference.value
+(array (identifier) @name @reference.value)
+(variable_declarator value: (identifier) @name @reference.value)
+(assignment_expression right: (identifier) @name @reference.value)
+(return_statement (identifier) @name @reference.value)
+(export_statement value: (identifier) @name @reference.value)
+
 ; top-level `const` that holds a value, not a function (those are functions above)
 
 (program [

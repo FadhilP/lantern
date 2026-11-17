@@ -11,7 +11,7 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::home::{Home, default_home};
 use crate::limits::MAX_MAX_FILE_SIZE;
 use crate::paths;
-use crate::query::code::{CodeHit, CodeQuery};
+use crate::query::code::{CodeFound, CodeQuery};
 use crate::query::graph::{Graph, GraphQuery};
 use crate::query::outline::Outline;
 use crate::query::refs::{RefHit, RefsQuery};
@@ -264,12 +264,12 @@ impl Lantern {
         query: &CodeQuery,
         freshness: Freshness,
         page: &PageRequest,
-    ) -> Result<Page<CodeHit>> {
+    ) -> Result<CodeFound> {
         let (opened, resolved) = self.open_root(cwd, freshness)?;
         let mut found = query::code::run(&opened, query, page)?;
         rebase(
             &resolved.scope,
-            found.rows.iter_mut().map(|hit| &mut hit.path),
+            found.page.rows.iter_mut().map(|hit| &mut hit.path),
         );
         Ok(found)
     }

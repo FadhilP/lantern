@@ -1,6 +1,6 @@
-//! `graph`: what calls X, and what does X call? Edges are resolved by name.
+//! `graph`: what calls X, and what does X call? Edges are calls and value uses, resolved by name.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use clap::ValueEnum;
 use rusqlite::{OptionalExtension, params};
@@ -45,9 +45,19 @@ pub struct Graph {
     pub truncated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unresolved: Vec<String>,
+    /// The root's name and called names that more than one definition has: edges are found by
+    /// name, so some of them can mean another definition.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub shared_names: Vec<SharedName>,
     /// Counted only for an empty graph.
     #[serde(skip)]
     pub incomplete: shard::Incomplete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SharedName {
+    pub name: String,
+    pub definitions: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -116,6 +126,7 @@ struct Builder<'graph> {
     edge_keys: HashSet<(usize, usize, RefKind)>,
     truncated: bool,
     unresolved: BTreeSet<String>,
+    shared: BTreeMap<String, usize>,
     by_name: HashMap<String, Vec<Definition>>,
 }
 
@@ -144,11 +155,14 @@ pub(crate) fn run(opened: &Opened, query: &GraphQuery) -> Result<Graph> {
         edge_keys: HashSet::new(),
         truncated: false,
         unresolved: BTreeSet::new(),
+        shared: BTreeMap::new(),
         by_name: HashMap::new(),
     };
     let (container, name) = split_qualified(&query.name);
     let mut roots = Vec::new();
-    for definition in builder.definitions_named(name)? {
+    let named = builder.definitions_named(name)?;
+    builder.note_shared(name, named.len());
+    for definition in named {
         if !query.kind.is_empty() && !query.kind.contains(&definition.kind) {
             continue;
         }
@@ -195,6 +209,11 @@ pub(crate) fn run(opened: &Opened, query: &GraphQuery) -> Result<Graph> {
         edges: builder.edges,
         truncated: builder.truncated,
         unresolved: builder.unresolved.into_iter().collect(),
+        shared_names: builder
+            .shared
+            .into_iter()
+            .map(|(name, definitions)| SharedName { name, definitions })
+            .collect(),
         incomplete,
     })
 }
@@ -236,6 +255,12 @@ impl Builder<'_> {
         Some(id)
     }
 
+    fn note_shared(&mut self, name: &str, definitions: usize) {
+        if definitions > 1 {
+            self.shared.insert(name.to_owned(), definitions);
+        }
+    }
+
     /// Every non-generated definition of `name`, in path order.
     fn definitions_named(&mut self, name: &str) -> Result<Vec<Definition>> {
         if let Some(found) = self.by_name.get(name) {
@@ -272,7 +297,8 @@ impl Builder<'_> {
         Ok(found)
     }
 
-    /// Calls to the definition's name, grouped by the definition that contains each one.
+    /// Calls and value uses of the definition's name, grouped by the definition that contains
+    /// each one.
     fn callers(&mut self, target: usize, definition: &Definition) -> Result<Vec<usize>> {
         let mut statement = self.opened.conn.prepare_cached(
             "SELECT f.path, f.flags, n.id, r.groups
@@ -295,7 +321,7 @@ impl Builder<'_> {
             let test = FileFlags(row.get(1)?).is_test();
             let groups: Vec<u8> = row.get(3)?;
             for call in refs::of_name(&groups, row.get(2)?)? {
-                if call.kind != RefKind::Call {
+                if !is_edge(call.kind) {
                     continue;
                 }
                 let symbol = match call.enclosing {
@@ -324,7 +350,9 @@ impl Builder<'_> {
         drop(rows);
         drop(statement);
         drop(enclosing);
-        sources.sort_by(|a, b| (&a.2, a.3).cmp(&(&b.2, b.3)));
+        // A call in the target's own file most likely means this definition, so it comes first
+        // and the node cap cuts the others.
+        sources.sort_by_key(|(_, _, path, line)| (*path != definition.path, path.clone(), *line));
         let mut added = Vec::new();
         for (source, kind, _, line) in sources {
             let Some(from) = self.node(&source) else {
@@ -336,17 +364,16 @@ impl Builder<'_> {
         Ok(added)
     }
 
-    /// Calls whose innermost definition is this one, resolved by name; code outside tests
-    /// never resolves to a definition in a test file.
+    /// Calls and value uses whose innermost definition is this one, resolved by name, with
+    /// targets in the same file first; code outside tests never resolves to a definition in a
+    /// test file.
     fn callees(&mut self, source: usize, definition: &Definition) -> Result<Vec<usize>> {
         let conn = &self.opened.conn;
         let blob_id: i64 = conn
             .prepare_cached("SELECT blob_id FROM symbols WHERE id = ?1")?
             .query_row([definition.id], |row| row.get(0))?;
         let mut calls = refs::of_blob(conn, blob_id)?;
-        calls.retain(|(_, call)| {
-            call.enclosing == Some(definition.id) && call.kind == RefKind::Call
-        });
+        calls.retain(|(_, call)| call.enclosing == Some(definition.id) && is_edge(call.kind));
         calls.sort_by_key(|&(_, call)| (call.line, call.col));
         let mut added = Vec::new();
         for (name_id, call) in calls {
@@ -362,6 +389,8 @@ impl Builder<'_> {
                 self.unresolved.insert(name);
                 continue;
             }
+            self.note_shared(&name, targets.len());
+            targets.sort_by_key(|target| target.path != definition.path);
             for target in targets {
                 let Some(to) = self.node(&Vertex::Definition(target)) else {
                     return Ok(added);
@@ -384,4 +413,9 @@ impl Builder<'_> {
             });
         }
     }
+}
+
+/// `type`, `import`, and `implementation` references are not uses of a definition's code.
+fn is_edge(kind: RefKind) -> bool {
+    matches!(kind, RefKind::Call | RefKind::Value)
 }
