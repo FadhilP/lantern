@@ -6,6 +6,8 @@ pub(crate) mod outline;
 pub(crate) mod refs;
 pub(crate) mod symbols;
 
+use std::path::{Path, PathBuf};
+
 use globset::{GlobBuilder, GlobMatcher};
 use rusqlite::Connection;
 use serde::Serialize;
@@ -90,6 +92,7 @@ const INVALID_CURSOR: &str =
 #[derive(Debug)]
 pub(crate) struct Opened {
     pub conn: Connection,
+    pub root: PathBuf,
     /// The start directory relative to the root; results outside it are dropped.
     pub scope: String,
     pub freshness: Freshness,
@@ -113,6 +116,7 @@ pub(crate) fn open(home: &Home, resolved: &Resolved, freshness: Freshness) -> Re
     let state = format!("{}\0{}", meta.root_key, meta.generation);
     Ok(Opened {
         conn,
+        root: target.root.clone(),
         scope: resolved.scope.clone(),
         freshness,
         indexed_at: meta.indexed_at,
@@ -247,7 +251,7 @@ pub(crate) struct PathFilter {
 }
 
 impl PathFilter {
-    pub fn new(globs: &[String], cwd_scope: &str) -> Result<Self> {
+    pub fn new(globs: &[String], root: &Path, cwd_scope: &str) -> Result<Self> {
         let mut filter = Self::default();
         for glob in globs {
             let (list, glob) = match glob.strip_prefix('!') {
@@ -259,7 +263,7 @@ impl PathFilter {
             let mut first_error = None;
             let before = list.len();
             for text in glob_readings(glob) {
-                match compile_path_glob(&text, cwd_scope) {
+                match compile_path_glob(&text, root, cwd_scope) {
                     Ok(matcher) => list.push(matcher),
                     Err(error) => {
                         first_error.get_or_insert(error);
@@ -370,18 +374,24 @@ fn brackets_as_text(glob: &str) -> Option<String> {
     Some(text)
 }
 
-fn compile_path_glob(glob: &str, cwd_scope: &str) -> Result<GlobMatcher> {
+fn compile_path_glob(glob: &str, root: &Path, cwd_scope: &str) -> Result<GlobMatcher> {
     // Windows users type `\`; globset reads it as an escape.
     let glob = if cfg!(windows) {
         glob.replace('\\', "/")
     } else {
         glob.to_owned()
     };
-    if glob.starts_with('/') || glob.contains(':') {
-        return Err(Error::usage(
-            "--path must be relative to the current directory",
-        ));
-    }
+    let absolute = glob.starts_with('/') || glob.contains(':');
+    let (glob, cwd_scope) = if absolute {
+        let inside = within_root(&glob, root).ok_or_else(|| {
+            Error::usage(
+                "--path is outside the workspace; give it relative to the current directory",
+            )
+        })?;
+        (inside, "")
+    } else {
+        (glob, cwd_scope)
+    };
     let pattern = if glob.contains('/') {
         paths::resolve_lexically(cwd_scope, &glob)
     } else {
@@ -393,6 +403,25 @@ fn compile_path_glob(glob: &str, cwd_scope: &str) -> Result<GlobMatcher> {
         .build()
         .map_err(|error| Error::usage(format!("invalid --path glob: {error}")))?
         .compile_matcher())
+}
+
+/// An absolute `/`-separated glob as a glob relative to `root`, when it lies inside it.
+fn within_root(glob: &str, root: &Path) -> Option<String> {
+    let root = root.to_string_lossy().replace('\\', "/");
+    let root = root.trim_end_matches('/');
+    let head = glob.get(..root.len())?;
+    let same_root = if cfg!(windows) {
+        head.eq_ignore_ascii_case(root)
+    } else {
+        head == root
+    };
+    if !same_root {
+        return None;
+    }
+    match &glob[root.len()..] {
+        "" | "/" => Some("**".to_owned()),
+        rest => rest.strip_prefix('/').map(str::to_owned),
+    }
 }
 
 /// The stored language names that `--language` selects.

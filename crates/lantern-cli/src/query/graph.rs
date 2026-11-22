@@ -142,7 +142,7 @@ pub(crate) fn run(opened: &Opened, query: &GraphQuery) -> Result<Graph> {
             "--max-nodes must be between 1 and {MAX_GRAPH_NODES}"
         )));
     }
-    let filter = PathFilter::new(&query.path, &opened.scope)?;
+    let filter = PathFilter::new(&query.path, &opened.root, &opened.scope)?;
     let mut builder = Builder {
         opened,
         filter: &filter,

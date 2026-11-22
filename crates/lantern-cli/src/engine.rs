@@ -229,6 +229,14 @@ impl Lantern {
     /// Resolves the root at `cwd`, refreshes it unless `freshness` is stale, and opens it.
     fn open_root(&self, cwd: &Path, freshness: Freshness) -> Result<(Opened, Resolved)> {
         let resolved = workspace::resolve(cwd, &self.home)?;
+        // Agents send their first queries in parallel, all with `--stale-ok`; without an index
+        // yet, each would fail.
+        let freshness = match freshness {
+            Freshness::Stale if !was_indexed(&self.home.shard_path(&resolved.target.root_key))? => {
+                Freshness::Walk
+            }
+            other => other,
+        };
         if freshness == Freshness::Walk {
             self.refuse_first_index(&resolved.target, true, false)?;
             refresh::refresh(

@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use regex::RegexBuilder;
 use serde_json::Value;
 
-use crate::common::{Fixture, count, names, strings};
+use crate::common::{Fixture, count, names, paths, strings};
 
 const CORPUS: &[(&str, &[u8])] = &[
     (
@@ -325,8 +325,14 @@ fn rows_cut_by_max_bytes_come_back_on_the_next_page() {
 #[test]
 fn stale_ok_returns_the_committed_state_without_a_walk() {
     let f = Fixture::new();
+    f.git("", &["init", "-q"]);
     f.write("a.ts", "export function old() {}\n");
-    assert_eq!(f.lantern(&["symbols", "old", "--stale-ok"]).code, 1);
+    // Agents send their first queries in parallel, all with --stale-ok.
+    let first = f.ok(&["symbols", "old", "--stale-ok"]);
+    assert_eq!(
+        (first["freshness"].as_str(), names(&first)),
+        (Some("walk"), strings(&["old"]))
+    );
     let indexed = f.ok(&["index"]);
     f.write("b.ts", "export function fresh() {}\n");
     let stale = f.ok(&["symbols", "fresh", "--stale-ok"]);
@@ -813,6 +819,10 @@ Needle
         f.text(&["code", "-i", "needle"]),
         f.text(&["code", "needle"])
     );
+    assert_eq!(
+        f.text(&["code", "-n", "needle"]),
+        f.text(&["code", "needle"])
+    );
     let context = f.lantern(&["code", "needle", "-C", "3"]);
     assert_eq!(context.code, 2);
     assert!(context.stderr.contains("--context 3"), "{}", context.stderr);
@@ -956,6 +966,39 @@ fn a_literal_alternation_with_no_match_searches_its_parts_on_every_page() {
 }
 
 #[test]
+fn an_empty_pattern_lists_the_files_that_a_path_glob_matches() {
+    let f = graph_fixture();
+    f.write("notes.md", "a note\n");
+    let listed = f.ok(&["code", "", "-l", "--path", "*.ts"]);
+    assert_eq!(paths(&listed), strings(&["a.ts", "b.ts", "c.ts"]));
+}
+
+#[test]
+fn an_absolute_path_glob_inside_the_root_matches_like_a_relative_one() {
+    let f = graph_fixture();
+    let root = f.root.to_str().expect("UTF-8 root");
+    let absolute = format!("{root}/a.*");
+    assert_eq!(
+        paths(&f.ok(&["code", "leaf", "--path", &absolute])),
+        strings(&["a.ts"])
+    );
+    let outside = format!("{}/**", f.home.to_str().expect("UTF-8 home"));
+    assert_eq!(f.lantern(&["code", "leaf", "--path", &outside]).code, 2);
+}
+
+#[test]
+fn graph_takes_several_names_and_limit_as_max_nodes() {
+    let f = graph_fixture();
+    let text = f.text(&["graph", "leaf", "top", "--direction", "callers"]);
+    assert!(
+        text.contains("== leaf\n") && text.contains("== top\n"),
+        "{text}"
+    );
+    let capped = f.ok(&["graph", "mid", "--limit", "1"]);
+    assert_eq!(capped["truncated"], true);
+}
+
+#[test]
 fn refs_take_several_names() {
     let f = graph_fixture();
     let text = f.text(&["refs", "leaf", "root"]);
@@ -1091,6 +1134,7 @@ fn only_a_git_repository_is_indexed_by_a_query_and_the_home_folder_needs_force()
     f.write("a.ts", "export const needle = 1;\n");
     let plain_folder = f.lantern(&["code", "needle"]);
     assert_eq!(plain_folder.code, 2, "{}", plain_folder.stderr);
+    assert_eq!(f.lantern(&["code", "needle", "--stale-ok"]).code, 2);
     assert!(
         plain_folder.stderr.contains("ask the user"),
         "{}",

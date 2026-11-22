@@ -50,7 +50,7 @@ pub(crate) fn run(
 ) -> Result<Page<RefHit>> {
     validate_text("the name", &query.name)?;
     validate_limit(request)?;
-    let filter = PathFilter::new(&query.path, &opened.scope)?;
+    let filter = PathFilter::new(&query.path, &opened.root, &opened.scope)?;
     let description = format!("refs:{query:?}:{}", opened.scope);
     let needed = opened.needed(&description, request)?;
 

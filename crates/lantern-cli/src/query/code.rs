@@ -107,14 +107,17 @@ const MAX_VERIFY_BATCH: usize = 4096;
 const FILE_LOOKUPS: usize = 1024;
 
 pub(crate) fn run(opened: &Opened, query: &CodeQuery, request: &PageRequest) -> Result<CodeFound> {
-    validate_text("the pattern", &query.pattern)?;
+    // An empty pattern matches every line, as in grep, so `"" -l --path GLOB` lists files.
+    if !query.pattern.is_empty() {
+        validate_text("the pattern", &query.pattern)?;
+    }
     validate_limit(request)?;
     if query.per_file > MAX_PER_FILE {
         return Err(Error::usage(format!(
             "--per-file must be at most {MAX_PER_FILE}"
         )));
     }
-    let filter = PathFilter::new(&query.path, &opened.scope)?;
+    let filter = PathFilter::new(&query.path, &opened.root, &opened.scope)?;
     let languages = language_names(query.language.as_deref())?;
     let description = format!("code:{query:?}:{}", opened.scope);
     let needed = opened.needed(&description, request)?;

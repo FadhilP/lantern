@@ -67,6 +67,13 @@
         (scoped_identifier name: (identifier) @name)
     ]) @reference.call
 
+; macro arguments parse as token trees, so a call there is a name and then a `(` tree
+
+(token_tree
+    (identifier) @name
+    .
+    (token_tree . "(") @reference.call)
+
 ((type_identifier) @name @reference.type (#not-eq? @name "Self"))
 
 ; implementations

@@ -121,7 +121,7 @@ pub(crate) fn run(
         )));
     }
     query::validate_limit(request)?;
-    let filter = PathFilter::new(&query.path, scope)?;
+    let filter = PathFilter::new(&query.path, root, scope)?;
     let mut diff = git::diff(root, query.range.as_deref())?;
     // Every untracked file is read, not only the page's: a definition can move into any of them.
     diff.files

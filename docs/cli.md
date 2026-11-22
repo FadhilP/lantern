@@ -10,7 +10,7 @@ lantern symbols [query]...[--kind K,...] [--language L] [--path GLOB]... [--incl
 lantern code    <pattern> | -e <pattern> [--regex] [--case-sensitive] [--path GLOB]... [--language L]
                           [--per-file N | -l] [--context N] [--sort relevance|path] [--include-generated]
 lantern refs    <name>... [--kind call|type|import|implementation|value,...] [--path GLOB]... [--include-generated]
-lantern graph   <name>    [--direction callers|callees|both] [--depth N] [--max-nodes N]
+lantern graph   <name>... [--direction callers|callees|both] [--depth N] [--max-nodes N]
                           [--kind K,...] [--path GLOB]... [--include-generated] [--stale-ok] [--max-bytes N]
 lantern outline <file>...
 lantern changes [RANGE]   [--path GLOB]... [--diff [NAME]]
@@ -54,7 +54,7 @@ The data directory is `%LOCALAPPDATA%\lantern` on Windows, `~/Library/Applicatio
 
 By default every query refreshes the index first. The refresh reads only new files, files whose metadata (identity, size, modification time, change time) changed, and files that changed within 2 seconds before the previous refresh or after it started. An edit that keeps all of that metadata is not seen until `index --rebuild`. Results are labeled `"freshness": "walk"`.
 
-`--stale-ok` skips the refresh and answers from the last committed index, labeled `"freshness": "stale"`. It fails with exit 1 when the root was never indexed.
+`--stale-ok` skips the refresh and answers from the last committed index, labeled `"freshness": "stale"`. When the root was never indexed, it refreshes first, as a query without it does, so parallel first queries can all use it.
 
 ## Commands
 
@@ -97,7 +97,8 @@ Row: `name, kind, container, path, line, end_line, signature, body?`. `body` is 
 Line search. The pattern is a literal unless `--regex` is set (Rust `regex` syntax). Matching is case-insensitive unless `--case-sensitive` is set. A regex matches within one line. Alternation is `a|b`; grep's `a\|b` matches a literal `|`. A literal pattern with `|` between two characters other than spaces (`load|save`, not `a | b` or `a\|b`) that matches nothing is searched again with each part between `|` as a literal alternative. The page then has `"alternatives": [parts]`, and the text output has a line `-- no literal match; ...`. The cursor of such a page resumes the same search.
 
 - `-e <pattern>` gives the pattern as an option, also when it starts with `-` (`-e --flag`).
-- `-i` is accepted and changes nothing, since matching already ignores case.
+- `-i` and `-n` are accepted and change nothing, since matching already ignores case and every match shows its line number.
+- An empty pattern (`""`) matches every line, as in grep, so `code "" -l --path GLOB` lists the indexed text files that the glob matches.
 
 - `--per-file N` caps the matches per file (default 5, max 1000). `match_count` still counts every match. `--per-file 0`, or `-l`/`--files`, lists only the files and their match counts.
 - `--context N` adds up to N lines as `before` and `after` on each match. A value over 50 counts as 50. Windows of nearby matches do not overlap: a line is shown once, so `before` and `after` can be shorter than N.
@@ -107,18 +108,18 @@ Row (one per file): `path, match_count, matches: [{line, column, text, before?, 
 
 ### `refs <name>...`
 
-References to an exact, case-sensitive name. With several names, each page follows a `== NAME` line in the text output; `--json` and `--cursor` take one name. `--kind call|type|import|implementation|value` filters them; separate several with commas (`--kind call,import`). Every language records `call` references. `type` references cover every type use in Dart, Go, Rust, and TypeScript/TSX; in C#, C++, Java, JavaScript, and PHP they cover only `new X` (C# also variable types and generic constraints). `import` references exist only for Dart and JavaScript/TypeScript/TSX. `implementation` references (base classes, interfaces, mixins, trait impls) exist in every language except C and Go. `value` references (JavaScript/TypeScript/TSX only) are a name passed or stored as a value, such as a callback in `onSave={save}`, `list.map(toOption)`, or `{ run: start }`; they are kept only for a name that the file defines or imports. Find other type uses and imports with `lantern code`.
+References to an exact, case-sensitive name. With several names, each page follows a `== NAME` line in the text output; `--json` and `--cursor` take one name. `--kind call|type|import|implementation|value` filters them; separate several with commas (`--kind call,import`). Every language records `call` references; in Rust, also calls inside macro arguments (`assert_eq!(parse(x), 1)`). `type` references cover every type use in Dart, Go, Rust, and TypeScript/TSX; in C#, C++, Java, JavaScript, and PHP they cover only `new X` (C# also variable types and generic constraints). `import` references exist only for Dart and JavaScript/TypeScript/TSX. `implementation` references (base classes, interfaces, mixins, trait impls) exist in every language except C and Go. `value` references (JavaScript/TypeScript/TSX only) are a name passed or stored as a value, such as a callback in `onSave={save}`, `list.map(toOption)`, or `{ run: start }`; they are kept only for a name that the file defines or imports. Find other type uses and imports with `lantern code`.
 
 Row: `path, line, column, kind, text, enclosing`. `enclosing` is `{name, container, kind}` of the innermost definition around the reference; it is left out at the top level. The page has `"resolution": "name"`.
 
-### `graph <name>`
+### `graph <name>...`
 
-Callers and callees of a name, breadth-first. The graph follows `call` and `value` references; an edge has the kind of its reference. Use `refs` for type uses, imports, and implementations.
+Callers and callees of a name, breadth-first. With several names, each graph follows a `== NAME` line in the text output; `--json` takes one name. The graph follows `call` and `value` references; an edge has the kind of its reference. Use `refs` for type uses, imports, and implementations.
 
 - Roots are the definitions of `name`; `--kind` and `--path` narrow them. Every match is a root. `Container.name` or `Container::name` keeps the definitions inside that container (case-insensitive).
 - `--direction callers`: calls to the name, grouped by their enclosing definition. A call outside any definition becomes a node of kind `file`.
 - `--direction callees`: calls whose innermost enclosing definition is this one, resolved to definitions by name. A definition outside test files never resolves to one in a test file.
-- `--depth N` (1–3, default 1) repeats the expansion. `--max-nodes N` (default 200, max 5000) stops it and sets `truncated`.
+- `--depth N` (1–3, default 1) repeats the expansion. `--max-nodes N` (default 200, max 5000; `--limit` is an alias) stops it and sets `truncated`.
 - `--max-bytes N` drops the last nodes found, with their edges, until the output fits, and sets `truncated`.
 
 ```json
@@ -128,7 +129,7 @@ Callers and callees of a name, breadth-first. The graph follows `call` and `valu
  "unresolved":["fetchUser"]}
 ```
 
-An edge's `line` is in the file of its `from` node. `unresolved` lists called names with no definition in the workspace. `shared_names: [{name, definitions}]` lists the root's name and the called names that more than one definition has: edges are found by name, so an edge to or from such a name can mean another definition. Callers in the root's file and callees in the caller's file come first, so `--max-nodes` cuts the others first. A graph is not a list, so it has no `--limit` or `--cursor`.
+An edge's `line` is in the file of its `from` node. `unresolved` lists called names with no definition in the workspace. `shared_names: [{name, definitions}]` lists the root's name and the called names that more than one definition has: edges are found by name, so an edge to or from such a name can mean another definition. Callers in the root's file and callees in the caller's file come first, so `--max-nodes` cuts the others first. A graph is not a list, so it has no `--cursor`.
 
 ### `outline <file>...`
 
@@ -166,7 +167,7 @@ List results look like this:
 
 ## `--path`
 
-A glob relative to the current directory. Without a `/` it matches at any depth (`*.test.ts`). With a `/` it is anchored to the current directory (`src/**/*.rs`, `../lib/*`). It must stay inside the workspace. Repeat `--path` to match any of several globs (`--path 'src/**' --path 'lib/**'`). A value without glob characters also matches the files inside a folder of that name, by the same depth rule: `--path src` also matches `**/src/**`, and `--path lib/src` also matches `lib/src/**`. A glob that starts with `!` excludes its matches (`--path '!**/test/**'`). With only exclude globs, every other path passes. A glob with `[`, `]`, `{`, or `}` also matches with those characters read as text, so `--path 'app/[id]/**'` and `--path 'app/[id]'` find a Next.js `[id]` folder. On Windows, `\` works as a separator, so it cannot escape a glob character.
+A glob relative to the current directory. Without a `/` it matches at any depth (`*.test.ts`). With a `/` it is anchored to the current directory (`src/**/*.rs`, `../lib/*`). It must stay inside the workspace. An absolute glob inside the root also works (`C:/repo/src/*.rs`); it is read from the root, not the current directory. Repeat `--path` to match any of several globs (`--path 'src/**' --path 'lib/**'`). A value without glob characters also matches the files inside a folder of that name, by the same depth rule: `--path src` also matches `**/src/**`, and `--path lib/src` also matches `lib/src/**`. A glob that starts with `!` excludes its matches (`--path '!**/test/**'`). With only exclude globs, every other path passes. A glob with `[`, `]`, `{`, or `}` also matches with those characters read as text, so `--path 'app/[id]/**'` and `--path 'app/[id]'` find a Next.js `[id]` folder. On Windows, `\` works as a separator, so it cannot escape a glob character.
 
 ## Errors and exit codes
 
@@ -175,7 +176,7 @@ Errors go to stderr as `{"error":{"code":"...","message":"..."}}`, with the mess
 | Exit | `code` | Meaning |
 |---|---|---|
 | 0 | — | Success. |
-| 1 | `failure` | The command failed: unreadable rule files or Git data, an exceeded limit, a refresh timeout, a root that is not indexed under `--stale-ok`, or a shard that SQLite cannot read (the message says to run `lantern index --rebuild`). |
+| 1 | `failure` | The command failed: unreadable rule files or Git data, an exceeded limit, a refresh timeout, or a shard that SQLite cannot read (the message says to run `lantern index --rebuild`). |
 | 2 | `usage` | Invalid arguments, glob, or cursor, a `--max-bytes` smaller than one result, a refused first index (see Roots and scope), or for `changes`: no Git repository, a revision git does not know, or no commit yet. |
 | 3 | `root_moved` | A directory indexed as a folder root is now inside a Git repository. |
 | 4 | `stale_cursor` | The index (for `changes`, the diff) changed since the cursor was made. |

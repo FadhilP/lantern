@@ -79,7 +79,7 @@ pub(crate) fn run(
     request: &PageRequest,
 ) -> Result<SymbolsFound> {
     validate_limit(request)?;
-    let filter = PathFilter::new(&query.path, &opened.scope)?;
+    let filter = PathFilter::new(&query.path, &opened.root, &opened.scope)?;
     let languages = language_names(query.language.as_deref())?;
     let description = format!("symbols:{query:?}:{}", opened.scope);
     let needed = opened.needed(&description, request)?;

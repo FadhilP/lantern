@@ -154,6 +154,9 @@ struct CodeArgs {
     /// Accepted from grep habit; matching already ignores case.
     #[arg(short = 'i', long, hide = true, conflicts_with = "case_sensitive")]
     ignore_case: bool,
+    /// Accepted from grep habit; every match already shows its line number.
+    #[arg(short = 'n', long, hide = true)]
+    line_number: bool,
     /// Repeat to match any of several globs; `!GLOB` excludes.
     #[arg(long, value_name = "GLOB")]
     path: Vec<String>,
@@ -194,12 +197,14 @@ struct RefsArgs {
 
 #[derive(Debug, Args)]
 struct GraphArgs {
-    name: String,
+    /// One or more names; each gets its own graph under a `== NAME` line.
+    #[arg(required = true, value_name = "NAME")]
+    names: Vec<String>,
     #[arg(long, value_enum, default_value_t = Direction::Both)]
     direction: Direction,
     #[arg(long, default_value_t = DEFAULT_GRAPH_DEPTH, value_name = "N")]
     depth: usize,
-    #[arg(long, default_value_t = DEFAULT_GRAPH_NODES, value_name = "N")]
+    #[arg(long, alias = "limit", default_value_t = DEFAULT_GRAPH_NODES, value_name = "N")]
     max_nodes: usize,
     /// One kind, or several separated by commas.
     #[arg(long, value_enum, value_delimiter = ',')]
@@ -494,6 +499,7 @@ fn code(lantern: &Lantern, cwd: &Path, printer: &Printer, args: CodeArgs) -> Res
         regex,
         case_sensitive,
         ignore_case: _,
+        line_number: _,
         path,
         language,
         per_file,
@@ -628,22 +634,41 @@ fn refs(lantern: &Lantern, cwd: &Path, printer: &Printer, args: RefsArgs) -> Res
 }
 
 fn graph(lantern: &Lantern, cwd: &Path, printer: &Printer, args: GraphArgs) -> Result<(), Error> {
-    let query = GraphQuery {
-        name: args.name,
-        direction: args.direction,
-        depth: args.depth,
-        max_nodes: args.max_nodes,
-        kind: args.kind,
-        path: args.path,
-        include_generated: args.include_generated,
+    let GraphArgs {
+        names,
+        direction,
+        depth,
+        max_nodes,
+        kind,
+        path,
+        include_generated,
+        stale_ok,
+        max_bytes,
+    } = args;
+    let page = PageArgs {
+        limit: None,
+        cursor: None,
+        stale_ok,
+        max_bytes,
     };
-    let graph = lantern.graph(cwd, &query, freshness(args.stale_ok))?;
-    let note = incomplete_note(graph.incomplete);
-    let empty = format!(
-        "no results; no definition named {}. To find it as text, try: lantern code \"{}\"{note}",
-        query.name, query.name
-    );
-    printer.graph(&graph, args.max_bytes, &empty)
+    for_each_query(printer, &page, names, |name, freshness| {
+        let query = GraphQuery {
+            name,
+            direction,
+            depth,
+            max_nodes,
+            kind: kind.clone(),
+            path: path.clone(),
+            include_generated,
+        };
+        let graph = lantern.graph(cwd, &query, freshness)?;
+        let note = incomplete_note(graph.incomplete);
+        let empty = format!(
+            "no results; no definition named {}. To find it as text, try: lantern code \"{}\"{note}",
+            query.name, query.name
+        );
+        printer.graph(&graph, max_bytes, &empty)
+    })
 }
 
 /// Text for an empty result: files that ran out of parse time hold no symbols to find, and

@@ -396,6 +396,10 @@ impl Tags {
         let (Some(name), Some((role, node))) = (name, tagged) else {
             return;
         };
+        // In a Rust token tree, `a + (b)` also puts a name before a `(` tree, but not right before it.
+        if node.kind() == "token_tree" && node.start_byte() != name.end_byte() {
+            return;
+        }
         let text = &source[name.byte_range()];
         if text.trim().is_empty() || text.len() > MAX_NAME_BYTES || text.contains('\n') {
             return;
@@ -980,6 +984,23 @@ mod tests {
                 .collect();
             assert_eq!(found, expected, "{language:?}");
         }
+    }
+
+    #[test]
+    fn rust_calls_in_macro_arguments_are_calls() {
+        let source = "fn run() {\n    assert_eq!(parse(x), 1);\n    print!(\"{}\", fmt::show(&a), a.len());\n    let _ = vec![a + (b)];\n}\n";
+        let call = |name: &str| (name.to_owned(), "call", Some("run".to_owned()));
+        assert_eq!(
+            references(Language::Rust, source),
+            vec![
+                call("assert_eq"),
+                call("parse"),
+                call("print"),
+                call("show"),
+                call("len"),
+                call("vec"),
+            ]
+        );
     }
 
     #[test]
